@@ -1,0 +1,7 @@
+[2026-02-08 13:28:49] log message #0
+[2026-02-08 13:29:19] log message #1
+[2026-02-08 13:29:49] log message #2
+[2026-02-08 13:30:19] log message #3
+[14:51:14] log message #0
+[14:51:44] log message #1
+[14:52:14] log message #2
