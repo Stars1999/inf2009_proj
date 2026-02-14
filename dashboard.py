@@ -97,7 +97,7 @@ class MainDashboard(ctk.CTkFrame):
         ctk.CTkLabel(self.sidebar, text="Control Centre", font=("Arial", 20, "bold")).pack(pady=20)
         
         self.nav_btns = {}
-        items = ["Homepage", "Key Management", "Key Tagging", "ESP32-C3 Configuration", "Logs", "Logout"]
+        items = ["Homepage", "Key Management", "ESP32-C3 Configuration", "Logs", "Logout"]
         for item in items:
             btn = ctk.CTkButton(self.sidebar, text=item, fg_color="white", text_color="black", 
                                corner_radius=10, border_width=1, border_color="black", height=45,
@@ -109,7 +109,7 @@ class MainDashboard(ctk.CTkFrame):
         self.content.pack(side="right", fill="both", expand=True, padx=20, pady=20)
         
         self.sub_frames = {}
-        for F in (HomeView, KeyMgmtView, BatchTaggingView, ESPConfigView, LogsView):
+        for F in (HomeView, KeyMgmtView, ESPConfigView, LogsView):
             self.sub_frames[F.name] = F(self.content, self.controller)
             self.sub_frames[F.name].place(relx=0, rely=0, relwidth=1, relheight=1)
             
@@ -150,14 +150,6 @@ class KeyMgmtView(ctk.CTkFrame):
         
         self.scroll = ctk.CTkScrollableFrame(self, corner_radius=30, border_width=1, border_color="#1a4d66")
         self.scroll.pack(fill="both", expand=True, padx=30, pady=10)
-        
-        # Key Management Controls
-        ctrl = ctk.CTkFrame(self, corner_radius=20, border_width=1, border_color="black", fg_color="white")
-        ctrl.pack(fill="x", padx=30, pady=20)
-        self.ent = ctk.CTkEntry(ctrl, placeholder_text="Key Number", width=250, height=45)
-        self.ent.pack(side="left", padx=20, pady=15)
-        ctk.CTkButton(ctrl, text="Add New Key", height=45, border_width=1, border_color="black", fg_color="white", text_color="black", command=self.add).pack(side="left", padx=10)
-        ctk.CTkButton(ctrl, text="Remove Key", height=45, border_width=1, border_color="black", fg_color="white", text_color="black", command=self.rem).pack(side="left", padx=10)
 
     def refresh(self):
         for w in self.scroll.winfo_children(): w.destroy()
@@ -173,47 +165,6 @@ class KeyMgmtView(ctk.CTkFrame):
         n = self.ent.get()
         if n in self.controller.keys: del self.controller.keys[n]; self.refresh()
 
-class BatchTaggingView(ctk.CTkFrame):
-    name = "Key Tagging"
-    def __init__(self, parent, controller):
-        super().__init__(parent, fg_color="white", border_width=1, border_color="black")
-        self.controller = controller
-        self.selected_keys = set()
-        
-        ctk.CTkLabel(self, text="Batch Key Tagging", font=("Arial", 32, "bold")).pack(pady=10)
-        
-        self.scroll = ctk.CTkScrollableFrame(self, corner_radius=30, border_width=1, border_color="#1a4d66", fg_color="#d9d9d9")
-        self.scroll.pack(fill="both", expand=True, padx=30, pady=10)
-
-        # Batch Tagging Controls
-        bottom = ctk.CTkFrame(self, corner_radius=20, border_width=1, border_color="black", fg_color="white")
-        bottom.pack(fill="x", padx=30, pady=20)
-        self.user = ctk.CTkEntry(bottom, placeholder_text="Enter Username", height=45, width=400)
-        self.user.pack(side="left", padx=20, pady=15)
-        
-        ctk.CTkButton(bottom, text="Untag Key", fg_color="white", text_color="black", border_width=1, height=45, command=self.untag).pack(side="right", padx=10)
-        ctk.CTkButton(bottom, text="Tag Key", fg_color="#3b8ed0", text_color="white", height=45, command=self.tag).pack(side="right", padx=10)
-
-    def refresh(self):
-        for w in self.scroll.winfo_children(): w.destroy()
-        for i, (name, status) in enumerate(self.controller.keys.items()):
-            bg = "#3b8ed0" if name in self.selected_keys else "white" # Highlight selected keys in blue
-            btn = ctk.CTkButton(self.scroll, text=name, fg_color=bg, text_color="black", border_width=1, 
-                                width=100, height=45, command=lambda n=name: self.toggle_key(n))
-            btn.grid(row=i//6, column=i%6, padx=10, pady=10)
-
-    def toggle_key(self, name):
-        if name in self.selected_keys: self.selected_keys.remove(name)
-        else: self.selected_keys.add(name)
-        self.refresh()
-
-    def tag(self):
-        print(f"Tagging {list(self.selected_keys)} to {self.user.get()}")
-        self.selected_keys.clear(); self.refresh()
-
-    def untag(self):
-        print(f"Untagging {list(self.selected_keys)}")
-        self.selected_keys.clear(); self.refresh()
 
 class ESPConfigView(ctk.CTkFrame):
     name = "ESP32-C3 Configuration"
