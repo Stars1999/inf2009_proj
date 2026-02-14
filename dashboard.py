@@ -21,7 +21,7 @@ class GovernanceApp(ctk.CTk):
         
         # State Management
         # Keys 1-24: Key 2 is "out"
-        self.keys = {f"Key {i}": ("in" if i != 2 else "out") for i in range(1, 25)}
+        self.keys = {f"Key {i}": "in" for i in range(1, 25)}
         self.all_logs = []
         
         self.container = ctk.CTkFrame(self)
@@ -55,8 +55,20 @@ class GovernanceApp(ctk.CTk):
         payload = msg.payload.decode()
         ts = datetime.now().strftime("%H:%M:%S")
         self.all_logs.append((ts, msg.topic, payload))
-        if "LogsView" in self.frames["MainDashboard"].sub_frames:
-             self.frames["MainDashboard"].sub_frames["LogsView"].refresh()
+        
+        # Color Toggle Logic
+        if payload in self.keys:
+            if msg.topic == "Key Unlocked":
+                self.keys[payload] = "out" # Red
+            elif msg.topic == "Key Returned":
+                self.keys[payload] = "in"  # Green
+            
+        # UI Refresh
+        if "MainDashboard" in self.frames:
+            subs = self.frames["MainDashboard"].sub_frames
+            if "Homepage" in subs: subs["Homepage"].refresh()
+            if "Logs" in subs: subs["Logs"].refresh()
+            if "Key Management" in subs: subs["Key Management"].refresh()
 
 # --- LOGIN PAGE ---
 class LoginPage(ctk.CTkFrame):
@@ -129,13 +141,34 @@ class HomeView(ctk.CTkFrame):
     name = "Homepage"
     def __init__(self, parent, controller):
         super().__init__(parent, fg_color="white", border_width=1, border_color="black")
-        grid = ctk.CTkFrame(self, fg_color="transparent")
-        grid.place(relx=0.5, rely=0.5, anchor="center")
-        # Dashboard Overview stats
-        stats = [("10", "Total Keys"), ("2", "Key Issued"), ("8", "Key In Vault"),
-                 ("4", "Total ESP32-C3"), ("3", "ESP32-C3 Online"), ("1", "ESP32-C3 Offline")]
+        self.controller = controller
+        self.grid_container = ctk.CTkFrame(self, fg_color="transparent")
+        self.grid_container.place(relx=0.5, rely=0.5, anchor="center")
+        self.refresh()
+
+    def refresh(self):
+        # Clear old stats
+        for widget in self.grid_container.winfo_children():
+            widget.destroy()
+
+        # Calculate dynamic counts
+        total_keys = len(self.controller.keys)
+        issued_keys = sum(1 for status in self.controller.keys.values() if status == "out")
+        vault_keys = sum(1 for status in self.controller.keys.values() if status == "in")
+
+        # Define stats list with calculated values
+        stats = [
+            (str(total_keys), "Total Keys"), 
+            (str(issued_keys), "Key Issued"), 
+            (str(vault_keys), "Key In Vault"),
+            ("4", "Total ESP32-C3"), 
+            ("3", "ESP32-C3 Online"), 
+            ("1", "ESP32-C3 Offline")
+        ]
+
         for i, (v, t) in enumerate(stats):
-            box = ctk.CTkFrame(grid, width=180, height=130, border_width=1, border_color="black", corner_radius=15, fg_color="white")
+            box = ctk.CTkFrame(self.grid_container, width=180, height=130, 
+                               border_width=1, border_color="black", corner_radius=15, fg_color="white")
             box.grid(row=i//3, column=i%3, padx=15, pady=15)
             box.pack_propagate(False)
             ctk.CTkLabel(box, text=v, font=("Arial", 28, "bold")).pack(pady=(30,0))
