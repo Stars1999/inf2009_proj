@@ -2,12 +2,32 @@ import customtkinter as ctk
 import paho.mqtt.client as mqtt
 import os
 import json
+import glob
+import time
+import pandas as pd
+import matplotlib.pyplot as plt
 from datetime import datetime
 
 # --- Global Config ---
 BROKER = "localhost"
 PORT = 1883
 LOG_DIR = "mqtt_logs"
+CALIB_STATES = ["door_closed", "door_open", "standing", "walking"]
+
+# where CSI CSV batches are stored on the Pi; adjust if you move the server
+CSI_DATA_DIR = os.path.expanduser("~/edge-esp32/csi_data")
+
+# legacy behaviour: fall back to local directory if CSI_DATA_DIR doesn’t exist
+
+CONFIG_FILE = "config.json"  # persists broker/port/csi directory
+
+# filenames for various saved state
+CALIB_FILE = "calib_states.json"           # per-node completed flags
+KEYS_FILE = "keys.json"                    # issued/in vault status
+VIEW_FILE = "view_state.json"              # last page/node
+THRESH_FILE = "thresholds.json"            # per-node threshold values
+ONLINE_TTL_SECONDS = 60
+
 
 if not os.path.exists(LOG_DIR):
     os.makedirs(LOG_DIR)
@@ -23,6 +43,32 @@ class GovernanceApp(ctk.CTk):
         # Keys 1-24: Key 2 is "out"
         self.keys = {f"Key {i}": "in" for i in range(1, 25)}
         self.all_logs = []
+        # By default every node has no completed calibrations
+        self.esp_nodes = {
+            f"RACK_{i}": {state: False for state in CALIB_STATES}
+            for i in range(1, 5)
+        }
+        # keep track of when we last heard from each node (for health)
+        self.node_last_seen = {}
+        self.node_online = {node_id: False for node_id in self.esp_nodes}
+        # store the last radio selection per node so the UI remembers it
+        self.last_calib_choice = {}
+        # remember which label we requested for each node so we can validate
+        self.expected_calib = {}
+        # thresholds per-node
+        self.thresholds = {}
+        # configuration state
+        self.config = {"broker": BROKER, "port": PORT, "csi_data_dir": CSI_DATA_DIR}
+        self.csi_data_dir = CSI_DATA_DIR
+        # state for remembering page/node
+        self.last_view = None
+        self.last_node = None
+        # load any previously saved data
+        self._load_keys()
+        self._load_calib_states()
+        self._load_thresholds()
+        self._load_view_state()
+        self._load_config()
         
         self.container = ctk.CTkFrame(self)
         self.container.pack(side="top", fill="both", expand=True)
@@ -38,23 +84,287 @@ class GovernanceApp(ctk.CTk):
 
         self.show_frame("LoginPage")
 
-        self.client = mqtt.Client()
+        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        self.client.on_connect = self.on_connect
+        self.client.on_disconnect = self.on_disconnect
         self.client.on_message = self.on_message
         try:
-            self.client.connect(BROKER, PORT, 60)
-            self.client.subscribe("#")
+            self.client.reconnect_delay_set(min_delay=1, max_delay=30)
+            self.client.connect_async(self.config.get("broker", BROKER), self.config.get("port", PORT), 60)
             self.client.loop_start()
-        except:
-            pass
+        except Exception as e:
+            print(f"WARNING: MQTT client setup failed: {e}")
+
+    def on_connect(self, client, userdata, flags, reason_code, properties):
+        try:
+            client.subscribe("#", qos=1)
+            ts = datetime.now().strftime("%H:%M:%S")
+            self.all_logs.append((ts, "MQTT", f"Connected (reason_code={reason_code})"))
+        except Exception as e:
+            print(f"WARNING: on_connect error: {e}")
+
+    def on_disconnect(self, client, userdata, flags, reason_code, properties):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.all_logs.append((ts, "MQTT", f"Disconnected (reason_code={reason_code})"))
+        # mark nodes offline until fresh status messages arrive
+        for node_id in self.node_online:
+            self.node_online[node_id] = False
+
+    def _publish_collect_with_retry(self, node_id, label, retries=3):
+        topic = f"/commands/{node_id}/collect"
+        # generate a simple session identifier (timestamp-based)
+        session = datetime.now().strftime("%Y%m%d%H%M%S")
+        payload = json.dumps({"label": label, "session": session})
+        # remember session in case we need to match later
+        self.expected_calib[node_id] = label
+        for attempt in range(1, retries + 1):
+            msg_info = self.client.publish(topic, payload, qos=1)
+            if msg_info.rc == mqtt.MQTT_ERR_SUCCESS:
+                return True
+            time.sleep(0.2 * attempt)
+        return False
 
     def show_frame(self, page_name):
         frame = self.frames[page_name]
         frame.tkraise()
 
+    # persistence helpers --------------------------------------------------
+    def _save_calib_states(self):
+        try:
+            with open(CALIB_FILE, "w") as f:
+                json.dump(self.esp_nodes, f)
+        except Exception as e:
+            print(f"WARNING: could not save calibration file: {e}")
+
+    # keys persistence -------------------------------------------------
+    def _save_keys(self):
+        try:
+            with open(KEYS_FILE, "w") as f:
+                json.dump(self.keys, f)
+        except Exception as e:
+            print(f"WARNING: could not save keys: {e}")
+
+    def _load_keys(self):
+        if not os.path.exists(KEYS_FILE):
+            return
+        try:
+            with open(KEYS_FILE, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self.keys.update(data)
+        except Exception as e:
+            print(f"WARNING: failed to load keys: {e}")
+
+    # view state persistence ------------------------------------------
+    def _save_view_state(self):
+        state = {"last_page": self.last_view, "last_node": self.last_node}
+        try:
+            with open(VIEW_FILE, "w") as f:
+                json.dump(state, f)
+        except Exception as e:
+            print(f"WARNING: could not save view state: {e}")
+
+    def _load_view_state(self):
+        if not os.path.exists(VIEW_FILE):
+            return
+        try:
+            with open(VIEW_FILE, "r") as f:
+                data = json.load(f)
+            self.last_view = data.get("last_page")
+            self.last_node = data.get("last_node")
+        except Exception as e:
+            print(f"WARNING: failed to load view state: {e}")
+
+    # thresholds persistence ------------------------------------------
+    def _save_thresholds_file(self):
+        try:
+            with open(THRESH_FILE, "w") as f:
+                json.dump(self.thresholds, f)
+        except Exception as e:
+            print(f"WARNING: could not save thresholds: {e}")
+
+    # configuration persistence ---------------------------------------
+    def _load_config(self):
+        if not os.path.exists(CONFIG_FILE):
+            return
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self.config.update(data)
+                # update attributes
+                self.csi_data_dir = self.config.get("csi_data_dir", CSI_DATA_DIR)
+        except Exception as e:
+            print(f"WARNING: failed to load config: {e}")
+
+    def _save_config(self):
+        try:
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(self.config, f)
+        except Exception as e:
+            print(f"WARNING: could not save config: {e}")
+
+    def _load_thresholds(self):
+        if not os.path.exists(THRESH_FILE):
+            return
+        try:
+            with open(THRESH_FILE, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                # ensure no node entry is a bare list (old bug)
+                for nid, vals in list(data.items()):
+                    if isinstance(vals, list):
+                        # convert to dict holding raw list so UI code doesn't break
+                        data[nid] = {"raw_list": vals}
+                self.thresholds.update(data)
+        except Exception as e:
+            print(f"WARNING: failed to load thresholds: {e}")
+
+    def _apply_thresholds(self, node_id, entries=None, show_feedback=True):
+        # called from UI (view) or when navigating away; `entries` is the
+        # dict maintained by the ESPConfigView instance.
+        if entries is None:
+            entries = getattr(self, 'current_threshold_entries', None)
+        if not entries:
+            return
+        vals = {}
+        for lbl, entry in entries.items():
+            txt = entry.get()
+            try:
+                vals[lbl] = int(txt)
+            except ValueError:
+                vals[lbl] = txt
+        self.thresholds[node_id] = vals
+        self._save_thresholds_file()
+        ts = datetime.now().strftime('%H:%M:%S')
+        self.all_logs.append((ts, 'Thresholds', f'{node_id} {vals}'))
+        # provide visual confirmation to the user
+        if show_feedback:
+            try:
+                popup = ctk.CTkToplevel(self)
+                popup.title("Thresholds Saved")
+                popup.geometry("300x120")
+                ctk.CTkLabel(popup, text="Thresholds successfully saved.", font=("Arial", 14)).pack(pady=20)
+                ctk.CTkButton(popup, text="OK", width=80, command=popup.destroy).pack(pady=10)
+            except Exception:
+                pass
+        # publish new threshold values to ESP32 immediately
+        try:
+            topic = f"/commands/{node_id}/thresholds"
+            mqtt_vals = {
+                "door_open": int(vals.get("Door Open Threshold:", 100)),
+                "door_close": int(vals.get("Door Close Threshold:", 100)),
+                "human": int(vals.get("Human Detected Threshold:", 100)),
+            }
+            # small retry loop for transient broker failures
+            for attempt in range(1, 4):
+                msg_info = self.client.publish(topic, json.dumps(mqtt_vals), qos=1)
+                if msg_info.rc == mqtt.MQTT_ERR_SUCCESS:
+                    break
+                time.sleep(0.2 * attempt)
+        except Exception:
+            pass
+        # refresh logs view if visible
+        if "MainDashboard" in self.frames:
+            subs = self.frames["MainDashboard"].sub_frames
+            if "Logs" in subs:
+                subs["Logs"].refresh()
+
+    def _load_calib_states(self):
+        if not os.path.exists(CALIB_FILE):
+            return
+        try:
+            with open(CALIB_FILE, "r") as f:
+                data = json.load(f)
+            # merge into default structure, ignore unknown nodes/states
+            for node, states in data.items():
+                if node in self.esp_nodes:
+                    for state, val in states.items():
+                        if state in self.esp_nodes[node] and isinstance(val, bool):
+                            self.esp_nodes[node][state] = val
+        except Exception as e:
+            print(f"WARNING: failed to load calib states: {e}")
+
     def on_message(self, client, userdata, msg):
-        payload = msg.payload.decode()
+        payload = msg.payload.decode(errors="replace")
         ts = datetime.now().strftime("%H:%M:%S")
+        now_epoch = time.time()
         self.all_logs.append((ts, msg.topic, payload))
+
+        completion_node = None
+        completion_state = None
+
+        topic_parts = msg.topic.strip("/").split("/")
+        if len(topic_parts) == 3 and topic_parts[0] == "sensors" and topic_parts[2] == "status":
+            node_id = topic_parts[1]
+            # update health timestamp for this node
+            self.node_last_seen[node_id] = now_epoch
+            self.node_online[node_id] = True
+            try:
+                payload_json = json.loads(payload)
+                evt = payload_json.get("event")
+                if evt == "node_offline":
+                    self.node_online[node_id] = False
+                elif evt == "node_online":
+                    self.node_online[node_id] = True
+                elif evt == "collection_progress":
+                    label = payload_json.get("label", "?")
+                    cur = payload_json.get("sub_batch_idx", "?")
+                    total = payload_json.get("total_sub_batches", "?")
+                    pct = payload_json.get("percent", "?")
+                    self.all_logs.append((ts, "Progress", f"{node_id} {label}: {cur}/{total} ({pct}%)"))
+                    # Update progress bar in the configuration view if visible
+                    if self.frames.get("MainDashboard"):
+                        subs = self.frames["MainDashboard"].sub_frames
+                        cfg = subs.get("ESP32-C3 Configuration")
+                        if cfg and cfg.current_node_id == node_id:
+                            try:
+                                ci = int(cur)
+                                ti = int(total)
+                                cfg.set_progress(ci, ti)
+                            except Exception:
+                                pass
+                elif evt == "thresholds":
+                    vals = payload_json.get("values")
+                    if isinstance(vals, list):
+                        # firmware sent raw list; convert into a dict for our storage
+                        # map the first few values to the known entry labels if possible
+                        stored = {}
+                        if self.frames.get("MainDashboard"):
+                            subs = self.frames["MainDashboard"].sub_frames
+                            cfg = subs.get("ESP32-C3 Configuration")
+                        else:
+                            cfg = None
+                        if cfg and cfg.current_node_id == node_id and cfg.current_threshold_entries:
+                            keys = list(cfg.current_threshold_entries.keys())
+                            for i, key in enumerate(keys):
+                                if i < len(vals):
+                                    stored[key] = int(vals[i]) if isinstance(vals[i], (int, float)) else vals[i]
+                        # if mapping failed, just keep the list safely under a special key
+                        if not stored:
+                            stored = {"raw_list": vals}
+                        self.thresholds[node_id] = stored
+                        self._save_thresholds_file()
+                        # populate UI entries with values if possible
+                        if cfg and cfg.current_node_id == node_id and cfg.current_threshold_entries:
+                            for i, key in enumerate(keys):
+                                try:
+                                    cfg.current_threshold_entries[key].delete(0, "end")
+                                    if i < len(vals):
+                                        cfg.current_threshold_entries[key].insert(0, str(int(vals[i])))
+                                except Exception:
+                                    pass
+                if payload_json.get("event") == "collection_complete":
+                    completion_node = node_id
+                    completion_state = payload_json.get("label")
+                    if completion_node in self.esp_nodes:
+                        # labels should be strings; ignore others
+                        if isinstance(completion_state, str) and completion_state in self.esp_nodes[completion_node]:
+                            self.esp_nodes[completion_node][completion_state] = True
+                            # persist state immediately
+                            self._save_calib_states()
+            except json.JSONDecodeError:
+                pass
         
         # Color Toggle Logic
         if payload in self.keys:
@@ -62,13 +372,27 @@ class GovernanceApp(ctk.CTk):
                 self.keys[payload] = "out" # Red
             elif msg.topic == "Key Returned":
                 self.keys[payload] = "in"  # Green
-            
-        # UI Refresh
-        if "MainDashboard" in self.frames:
-            subs = self.frames["MainDashboard"].sub_frames
-            if "Homepage" in subs: subs["Homepage"].refresh()
-            if "Logs" in subs: subs["Logs"].refresh()
-            if "Key Management" in subs: subs["Key Management"].refresh()
+            # persist and log change
+            self._save_keys()
+            self.all_logs.append((ts, "Key", f"{payload} {self.keys[payload]}"))
+
+        # UI Refresh (thread-safe)
+        def refresh_ui():
+            if "MainDashboard" in self.frames:
+                subs = self.frames["MainDashboard"].sub_frames
+                if "Homepage" in subs:
+                    subs["Homepage"].refresh()
+                if "Logs" in subs:
+                    subs["Logs"].refresh()
+                if "Key Management" in subs:
+                    subs["Key Management"].refresh()
+                if "ESP32-C3 Configuration" in subs:
+                    subs["ESP32-C3 Configuration"].refresh()
+                if completion_node and completion_state and "ESP32-C3 Configuration" in subs:
+                    subs["ESP32-C3 Configuration"].on_calibration_complete(completion_node, completion_state)
+                    # also log success/mismatch, the method itself handles the entry
+
+        self.after(0, refresh_ui)
 
 # --- LOGIN PAGE ---
 class LoginPage(ctk.CTkFrame):
@@ -109,7 +433,7 @@ class MainDashboard(ctk.CTkFrame):
         ctk.CTkLabel(self.sidebar, text="Control Centre", font=("Arial", 20, "bold")).pack(pady=20)
         
         self.nav_btns = {}
-        items = ["Homepage", "Key Management", "ESP32-C3 Configuration", "Logs", "Logout"]
+        items = ["Homepage", "Key Management", "ESP32-C3 Configuration", "Logs", "Graphs", "Settings", "Logout"]
         for item in items:
             btn = ctk.CTkButton(self.sidebar, text=item, fg_color="white", text_color="black", 
                                corner_radius=10, border_width=1, border_color="black", height=45,
@@ -121,19 +445,47 @@ class MainDashboard(ctk.CTkFrame):
         self.content.pack(side="right", fill="both", expand=True, padx=20, pady=20)
         
         self.sub_frames = {}
-        for F in (HomeView, KeyMgmtView, ESPConfigView, LogsView):
+        for F in (HomeView, KeyMgmtView, ESPConfigView, LogsView, GraphsView, SettingsView):
             self.sub_frames[F.name] = F(self.content, self.controller)
             self.sub_frames[F.name].place(relx=0, rely=0, relwidth=1, relheight=1)
-            
-        self.switch_view("Homepage")
+        # restore last-view if available (stored on controller)
+        if self.controller.last_view and self.controller.last_view in self.sub_frames:
+            # defer until after frames are laid out
+            self.after(100, lambda: self.switch_view(self.controller.last_view))
+            if self.controller.last_view == "ESP32-C3 Configuration" and self.controller.last_node:
+                # show node when user returns
+                def show_node():
+                    vf = self.sub_frames.get("ESP32-C3 Configuration")
+                    if vf:
+                        vf.show_details(self.controller.last_node)
+                self.after(150, show_node)
+        else:
+            self.switch_view("Homepage")
 
     def switch_view(self, name):
-        if name == "Logout": self.controller.show_frame("LoginPage")
+        # if leaving ESPConfig, auto-save any thresholds the user may have edited
+        if self.controller.last_view == "ESP32-C3 Configuration":
+            cfg = self.sub_frames.get("ESP32-C3 Configuration")
+            if cfg and cfg.current_node_id:
+                # delegate to controller method which handles persistence
+                self.controller._apply_thresholds(cfg.current_node_id, cfg.current_threshold_entries, show_feedback=False)
+        if name == "Logout":
+            self.controller.show_frame("LoginPage")
         else:
             for n, b in self.nav_btns.items():
                 b.configure(fg_color="#d9d9d9" if n == name else "white")
             self.sub_frames[name].tkraise()
-            if hasattr(self.sub_frames[name], "refresh"): self.sub_frames[name].refresh()
+            if hasattr(self.sub_frames[name], "refresh"):
+                self.sub_frames[name].refresh()
+            # remember state
+            # store on controller instead of self
+            self.controller.last_view = name
+            if name == "ESP32-C3 Configuration":
+                cur = self.sub_frames[name].current_node_id
+                self.controller.last_node = cur
+            else:
+                self.controller.last_node = None
+            self.controller._save_view_state()
 
 # --- VIEWS ---
 
@@ -155,15 +507,26 @@ class HomeView(ctk.CTkFrame):
         total_keys = len(self.controller.keys)
         issued_keys = sum(1 for status in self.controller.keys.values() if status == "out")
         vault_keys = sum(1 for status in self.controller.keys.values() if status == "in")
-
+        # estimate online nodes: seen within last ONLINE_TTL_SECONDS
+        now = time.time()
+        online = 0
+        for node_id in self.controller.esp_nodes:
+            seen = self.controller.node_last_seen.get(node_id, 0)
+            is_recent = (now - seen) < ONLINE_TTL_SECONDS
+            if self.controller.node_online.get(node_id, False) and is_recent:
+                online += 1
+            elif not is_recent:
+                self.controller.node_online[node_id] = False
+        total_nodes = len(self.controller.esp_nodes)
+        offline = total_nodes - online
         # Define stats list with calculated values
         stats = [
             (str(total_keys), "Total Keys"), 
             (str(issued_keys), "Key Issued"), 
             (str(vault_keys), "Key In Vault"),
-            ("4", "Total ESP32-C3"), 
-            ("3", "ESP32-C3 Online"), 
-            ("1", "ESP32-C3 Offline")
+            (str(total_nodes), "Total ESP32-C3"), 
+            (str(online), "ESP32-C3 Online"), 
+            (str(offline), "ESP32-C3 Offline")
         ]
 
         for i, (v, t) in enumerate(stats):
@@ -193,10 +556,16 @@ class KeyMgmtView(ctk.CTkFrame):
 
     def add(self):
         n = self.ent.get()
-        if n: self.controller.keys[n] = "in"; self.refresh()
+        if n:
+            self.controller.keys[n] = "in"
+            self.controller._save_keys()
+            self.refresh()
     def rem(self):
         n = self.ent.get()
-        if n in self.controller.keys: del self.controller.keys[n]; self.refresh()
+        if n in self.controller.keys:
+            del self.controller.keys[n]
+            self.controller._save_keys()
+            self.refresh()
 
 
 class ESPConfigView(ctk.CTkFrame):
@@ -205,7 +574,8 @@ class ESPConfigView(ctk.CTkFrame):
         super().__init__(parent, fg_color="white", border_width=1, border_color="black")
         self.controller = controller
         ctk.CTkLabel(self, text="ESP32-C3 Settings", font=("Arial", 40, "bold")).pack(pady=10)
-        
+
+        # build UI once during initialization; refresh will only touch the table
         main = ctk.CTkFrame(self, fg_color="transparent")
         main.pack(fill="both", expand=True, padx=20)
         
@@ -216,36 +586,100 @@ class ESPConfigView(ctk.CTkFrame):
         node_scroll = ctk.CTkScrollableFrame(left, fg_color="transparent")
         node_scroll.pack(fill="both", expand=True, padx=10, pady=10)
 
+        self.bulk_selected = {}
+        self.node_status_labels = {}
+        self.node_buttons = {}
+        self.bulk_label_var = ctk.StringVar(value="door_closed")
+
         # 4 Nodes total for now
         for i in range(1, 5):
-            node_id = f"ESP32-C3-00{i}"
-            btn = ctk.CTkButton(node_scroll, text=f"ESP32 Node {i}", fg_color="white", text_color="black", border_width=1, 
+            node_id = f"RACK_{i}"
+            row = ctk.CTkFrame(node_scroll, fg_color="transparent")
+            row.pack(pady=6, padx=10, fill="x")
+
+            var = ctk.BooleanVar(value=False)
+            self.bulk_selected[node_id] = var
+            ctk.CTkCheckBox(row, text="", variable=var, width=20).pack(side="left", padx=(0, 6))
+
+            btn = ctk.CTkButton(row, text=f"ESP32 Node {i}", fg_color="white", text_color="black", border_width=1,
                                 command=lambda n=node_id: self.show_details(n))
-            btn.pack(pady=10, padx=20, fill="x")
+            btn.pack(side="left", fill="x", expand=True)
+            self.node_buttons[node_id] = btn
+
+            status_dot = ctk.CTkLabel(row, text="●", text_color="gray", width=20)
+            status_dot.pack(side="right", padx=(6, 0))
+            self.node_status_labels[node_id] = status_dot
+
+        bulk_box = ctk.CTkFrame(left, fg_color="transparent")
+        bulk_box.pack(fill="x", padx=12, pady=(0, 10))
+        ctk.CTkLabel(bulk_box, text="Bulk Label", font=("Arial", 13, "bold")).pack(anchor="w", pady=(6, 4))
+        for state in CALIB_STATES:
+            ctk.CTkRadioButton(bulk_box, text=state, variable=self.bulk_label_var, value=state).pack(anchor="w")
+        ctk.CTkButton(
+            bulk_box,
+            text="Start Selected Racks",
+            fg_color="#3b8ed0",
+            command=self.start_selected_racks
+        ).pack(fill="x", pady=(8, 0))
         
         # Right Panel (Node Specific Details)
-        self.right = ctk.CTkFrame(main, border_width=1, border_color="black", corner_radius=30, fg_color="white")
+        # right panel becomes scrollable so contents never get clipped
+        self.right = ctk.CTkScrollableFrame(main, border_width=1, border_color="black",
+                                            corner_radius=30, fg_color="white")
         self.right.pack(side="right", fill="both", expand=True, padx=10, pady=10)
         
         self.detail_widgets = []
+        self.calibration_table_widgets = []
+        self.current_node_id = None
+        self.radio_var = ctk.StringVar(value="door_closed")
+        self.start_btn_ref = None
+        self.status_lbl_ref = None
+        # placeholder label lives inside scrollable frame
         self.placeholder = ctk.CTkLabel(self.right, text="Select a node to view details", text_color="gray")
-        self.placeholder.place(relx=0.5, rely=0.5, anchor="center")
+        # use pack instead of place so it scrolls naturally
+        self.placeholder.pack(pady=20)
+
+    def refresh(self):
+        # when the frame is raised, make sure the table reflects the current
+        # saved state for whatever node is selected
+        self._refresh_node_status_list()
+        if self.current_node_id:
+            self._render_calibration_table(self.current_node_id)
+
+    def _refresh_node_status_list(self):
+        now = time.time()
+        for node_id, dot in self.node_status_labels.items():
+            seen = self.controller.node_last_seen.get(node_id, 0)
+            online = self.controller.node_online.get(node_id, False) and ((now - seen) < ONLINE_TTL_SECONDS)
+            dot.configure(text_color="#2e7d32" if online else "gray")
 
     def show_details(self, node_id):
-        self.placeholder.place_forget()
+        self.current_node_id = node_id
+        # remember selection for next launch
+        self.controller.last_node = node_id
+        self.controller._save_view_state()
+        self.placeholder.pack_forget()
         for w in self.detail_widgets: w.destroy()
         self.detail_widgets = []
+        self.calibration_table_widgets = []
+        self.start_btn_ref = None
+        self.status_lbl_ref = None
+        # restore last radio choice for this node if available
+        default_choice = self.controller.last_calib_choice.get(node_id, "door_closed")
+        self.radio_var = ctk.StringVar(value=default_choice)
 
         # Hardcoded static and threshold values
         fields = [
             ("Node Number:", node_id),
-            ("Connection:", "UP"),
+            ("Connection:", "UP" if self.controller.node_online.get(node_id, False) else "DOWN"),
             ("Door Status:", "CLOSE"),
             ("Door Open Threshold:", "100"),
             ("Door Close Threshold:", "100"),
             ("Human Detected Threshold:", "100")
         ]
 
+        # keep entries so they can be saved later
+        self.current_threshold_entries = {}
         for lbl, val in fields:
             f = ctk.CTkFrame(self.right, fg_color="transparent")
             f.pack(fill="x", padx=30, pady=8)
@@ -254,14 +688,416 @@ class ESPConfigView(ctk.CTkFrame):
             
             # Editable thresholds vs static labels
             if "Threshold" in lbl:
-                e = ctk.CTkEntry(f, width=120); e.insert(0, val); e.pack(side="right")
+                e = ctk.CTkEntry(f, width=120)
+                # load saved value if present
+                saved = self.controller.thresholds.get(node_id, {}).get(lbl, val)
+                e.insert(0, saved)
+                e.pack(side="right")
+                self.current_threshold_entries[lbl] = e
             else:
                 ctk.CTkLabel(f, text=val, text_color="gray").pack(side="right")
+
+        divider = ctk.CTkFrame(self.right, height=1, fg_color="#cccccc")
+        divider.pack(fill="x", padx=30, pady=(8, 14))
+        self.detail_widgets.append(divider)
+
+        radio_group = ctk.CTkFrame(self.right, fg_color="transparent")
+        radio_group.pack(fill="x", padx=30, pady=4)
+        self.detail_widgets.append(radio_group)
+        ctk.CTkLabel(radio_group, text="Calibration Label:", text_color="black", font=("Arial", 16)).pack(anchor="w")
+
+        for state in CALIB_STATES:
+            rb = ctk.CTkRadioButton(radio_group, text=state, variable=self.radio_var, value=state)
+            rb.pack(anchor="w", pady=2)
+
+        self.start_btn_ref = ctk.CTkButton(
+            self.right,
+            text="Start Calibration",
+            fg_color="#3b8ed0",
+            command=lambda n=node_id: self.start_calibration(n)
+        )
+        self.start_btn_ref.pack(pady=(10, 6))
+        self.detail_widgets.append(self.start_btn_ref)
+
+        self.status_lbl_ref = ctk.CTkLabel(self.right, text="Status: Idle", text_color="gray")
+        self.status_lbl_ref.pack(pady=(0, 10))
+        self.detail_widgets.append(self.status_lbl_ref)
+
+        self._render_calibration_table(node_id)
 
         btn_f = ctk.CTkFrame(self.right, fg_color="transparent")
         btn_f.pack(pady=20); self.detail_widgets.append(btn_f)
         ctk.CTkButton(btn_f, text="Cancel", fg_color="white", text_color="black", border_width=1, width=100).pack(side="left", padx=10)
-        ctk.CTkButton(btn_f, text="Save", width=100, fg_color="#3b8ed0").pack(side="left", padx=10)
+        ctk.CTkButton(btn_f, text="Save", width=100, fg_color="#3b8ed0",
+                      command=lambda n=node_id: self.controller._apply_thresholds(n, self.current_threshold_entries)).pack(side="left", padx=10)
+        ctk.CTkButton(btn_f, text="Reset Calibrations", width=140, fg_color="#ff5555", text_color="white",
+                      command=self._reset_calibrations).pack(side="left", padx=10)
+
+    def set_progress(self, cur, total):
+        # initialize progress bar if missing
+        if not hasattr(self, 'progress_bar'):
+            self.progress_bar = ctk.CTkProgressBar(self.right, width=300)
+            self.progress_bar.pack(pady=(4,10))
+        self.progress_bar.set(cur/total)
+        if self.status_lbl_ref:
+            self.status_lbl_ref.configure(text=f"Status: {cur}/{total} sub-batches uploaded")
+
+    def _render_calibration_table(self, node_id):
+        for w in self.calibration_table_widgets:
+            if w in self.detail_widgets:
+                self.detail_widgets.remove(w)
+            w.destroy()
+        self.calibration_table_widgets = []
+
+        title = ctk.CTkLabel(self.right, text="Last Calibrated States", text_color="black", font=("Arial", 16, "bold"))
+        title.pack(anchor="w", padx=30, pady=(2, 6))
+        self.calibration_table_widgets.append(title)
+        self.detail_widgets.append(title)
+
+        # ensure the map exists (in case we added a node later)
+        state_map = self.controller.esp_nodes.setdefault(node_id, {s: False for s in CALIB_STATES})
+        for state in CALIB_STATES:
+            row = ctk.CTkFrame(self.right, fg_color="transparent")
+            row.pack(fill="x", padx=30, pady=2)
+            self.calibration_table_widgets.append(row)
+            self.detail_widgets.append(row)
+
+            ctk.CTkLabel(row, text=state, text_color="black", font=("Arial", 14)).pack(side="left")
+            done = state_map.get(state, False)
+            status_text = "✓ Done" if done else "○ Pending"
+            status_color = "#2e7d32" if done else "gray"
+            ctk.CTkLabel(row, text=status_text, text_color=status_color, font=("Arial", 14)).pack(side="right")
+
+    def start_calibration(self, node_id):
+        selected_state = self.radio_var.get()
+        # remember choice so UI can restore it later
+        self.controller.last_calib_choice[node_id] = selected_state
+        # record what we expect back
+        self.controller.expected_calib[node_id] = selected_state
+
+        # reset progress UI
+        try:
+            self.set_progress(0,1)
+        except Exception:
+            pass
+        # attempt to publish command with retries
+        ok = self.controller._publish_collect_with_retry(node_id, selected_state, retries=3)
+        if not ok:
+            # publication failed locally; inform user and leave button enabled
+            if self.status_lbl_ref:
+                self.status_lbl_ref.configure(
+                    text="Status: Publish failed",
+                    text_color="red"
+                )
+                # revert to idle after a moment
+                def restore_idle():
+                    if self.status_lbl_ref:
+                        self.status_lbl_ref.configure(text="Status: Idle", text_color="gray")
+                self.after(3000, restore_idle)
+            return
+
+        # disable button only after we know the message was sent successfully
+        if self.start_btn_ref:
+            self.start_btn_ref.configure(state="disabled")
+
+        if self.status_lbl_ref:
+            self.status_lbl_ref.configure(
+                text=f"Status: Calibrating {node_id} for {selected_state}... Please wait (~20s)",
+                text_color="#1a4d66"
+            )
+
+    def start_selected_racks(self):
+        selected_nodes = [node for node, var in self.bulk_selected.items() if var.get()]
+        if not selected_nodes:
+            popup = ctk.CTkToplevel(self)
+            popup.title("No racks selected")
+            popup.geometry("320x120")
+            ctk.CTkLabel(popup, text="Select at least one rack.", font=("Arial", 14)).pack(pady=20)
+            ctk.CTkButton(popup, text="OK", width=80, command=popup.destroy).pack()
+            return
+
+        selected_state = self.bulk_label_var.get()
+        success_count = 0
+        failed_nodes = []
+        for node_id in selected_nodes:
+            self.controller.last_calib_choice[node_id] = selected_state
+            self.controller.expected_calib[node_id] = selected_state
+            if self.controller._publish_collect_with_retry(node_id, selected_state, retries=3):
+                success_count += 1
+            else:
+                failed_nodes.append(node_id)
+
+        ts = datetime.now().strftime('%H:%M:%S')
+        if failed_nodes:
+            self.controller.all_logs.append((
+                ts,
+                "Bulk",
+                f"Started {selected_state} for {success_count}/{len(selected_nodes)} racks; failed: {', '.join(failed_nodes)}"
+            ))
+        else:
+            self.controller.all_logs.append((ts, "Bulk", f"Started {selected_state} for {success_count}/{len(selected_nodes)} racks"))
+
+        popup = ctk.CTkToplevel(self)
+        popup.title("Bulk calibration")
+        popup.geometry("420x170")
+        msg = f"Started {selected_state} on {success_count}/{len(selected_nodes)} selected racks."
+        if failed_nodes:
+            msg += f"\nFailed: {', '.join(failed_nodes)}"
+        ctk.CTkLabel(popup, text=msg, font=("Arial", 13), justify="left").pack(pady=24)
+        ctk.CTkButton(popup, text="OK", width=90, command=popup.destroy).pack()
+
+    def on_calibration_complete(self, node_id, state):
+        # if we previously sent a command, verify the returned label
+        expected = self.controller.expected_calib.get(node_id)
+        if expected is not None and expected != state:
+            # mismatch occurred; warn and let user retry explicitly
+            print(f"WARNING: node {node_id} reported '{state}' but expected '{expected}'")
+            if self.current_node_id == node_id:
+                # still on the same node, show a warning popup
+                self._show_mismatch_popup(node_id, state, expected)
+                # recover UI so user can retry
+                if self.start_btn_ref:
+                    self.start_btn_ref.configure(state="normal")
+                if self.status_lbl_ref:
+                    self.status_lbl_ref.configure(text="Status: Idle", text_color="gray")
+            # clear expected label; require explicit retry from user
+            self.controller.expected_calib.pop(node_id, None)
+            return
+
+        # either we had no expectation, or the labels match
+        if node_id in self.controller.esp_nodes:
+            self.controller.esp_nodes[node_id][state] = True
+            self.controller._save_calib_states()
+
+        # remove the stored expectation (if any)
+        self.controller.expected_calib.pop(node_id, None)
+
+        # if user has navigated away, no further UI changes needed
+        if self.current_node_id != node_id:
+            return
+
+        if self.start_btn_ref:
+            self.start_btn_ref.configure(state="normal")
+        if self.status_lbl_ref:
+            self.status_lbl_ref.configure(text="Status: Idle", text_color="gray")
+
+        self._render_calibration_table(node_id)
+        # clear progress bar after completion
+        if self.current_node_id == node_id and hasattr(self, 'progress_bar'):
+            self.progress_bar.set(0)
+        self._show_calibration_popup(node_id, state)
+
+    def _show_calibration_popup(self, node_id, state):
+        popup = ctk.CTkToplevel(self)
+        popup.title("Calibration Complete!")
+        popup.geometry("340x180")
+
+        ctk.CTkLabel(popup, text="Calibration Complete!", font=("Arial", 20, "bold")).pack(pady=(20, 8))
+        ctk.CTkLabel(popup, text=f"{node_id} - {state}", text_color="gray").pack(pady=(0, 16))
+
+        btn_row = ctk.CTkFrame(popup, fg_color="transparent")
+        btn_row.pack(pady=8)
+
+        ctk.CTkButton(btn_row, text="Close", fg_color="white", text_color="black", border_width=1,
+                      command=popup.destroy).pack(side="left", padx=8)
+        ctk.CTkButton(btn_row, text="View Graph", fg_color="#3b8ed0",
+                      command=lambda: self._open_graph_and_close(popup, node_id, state)).pack(side="left", padx=8)
+
+    def _open_graph_and_close(self, popup, node_id, state):
+        popup.destroy()
+        self.view_graph(node_id, state)
+
+    def view_graph(self, node_id, state):
+        # pick base directory dynamically; preference given to configured path
+        base = self.controller.csi_data_dir if hasattr(self.controller, 'csi_data_dir') and os.path.exists(self.controller.csi_data_dir) \
+               else (CSI_DATA_DIR if os.path.exists(CSI_DATA_DIR) else "csi_data")
+        state_dir = os.path.join(base, node_id, state)
+        csv_files = glob.glob(os.path.join(state_dir, "*.csv"))
+
+        if not csv_files:
+            no_data = ctk.CTkToplevel(self)
+            no_data.title("No Data")
+            no_data.geometry("300x120")
+            ctk.CTkLabel(no_data, text="No CSV files found for this calibration.").pack(pady=16)
+            ctk.CTkButton(no_data, text="Close", command=no_data.destroy).pack(pady=8)
+            return
+
+        latest_csv = max(csv_files, key=os.path.getmtime)
+        df = pd.read_csv(latest_csv)
+
+        subcarrier_cols = [col for col in df.columns if col.startswith("SC_")]
+        if not subcarrier_cols:
+            subcarrier_cols = df.select_dtypes(include="number").columns.tolist()
+
+        if not subcarrier_cols:
+            invalid = ctk.CTkToplevel(self)
+            invalid.title("Invalid CSV")
+            invalid.geometry("300x120")
+            ctk.CTkLabel(invalid, text="No numeric subcarrier columns found.").pack(pady=16)
+            ctk.CTkButton(invalid, text="Close", command=invalid.destroy).pack(pady=8)
+            return
+
+        mean_series = df[subcarrier_cols].mean(axis=1)
+
+        plt.figure(figsize=(10, 4))
+        plt.plot(mean_series, label=f"{node_id} - {state} mean")
+        plt.title(f"CSI Mean Signal ({node_id} | {state})")
+        plt.xlabel("Sample Index")
+        plt.ylabel("Mean Amplitude")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    def _show_mismatch_popup(self, node_id, received, expected):
+        # show visible warning popup
+        popup = ctk.CTkToplevel(self)
+        popup.title("Calibration Label Mismatch")
+        popup.geometry("420x170")
+        ctk.CTkLabel(popup, text="Calibration mismatch detected", font=("Arial", 18, "bold")).pack(pady=(16, 8))
+        ctk.CTkLabel(
+            popup,
+            text=f"{node_id} reported '{received}' but expected '{expected}'.",
+            text_color="gray"
+        ).pack(pady=(0, 12))
+        ctk.CTkButton(popup, text="OK", width=90, command=popup.destroy).pack()
+
+        # also add to log
+        ts = datetime.now().strftime('%H:%M:%S')
+        self.controller.all_logs.append((ts, 'Mismatch', f'{node_id} reported {received} (expected {expected})'))
+        # update log panel if visible
+        if "MainDashboard" in self.controller.frames:
+            subs = self.controller.frames["MainDashboard"].sub_frames
+            if "Logs" in subs:
+                subs["Logs"].refresh()
+
+    def _reset_calibrations(self):
+        # clear all esp_nodes flags and delete persisted file
+        for node in self.controller.esp_nodes:
+            for state in self.controller.esp_nodes[node]:
+                self.controller.esp_nodes[node][state] = False
+        try:
+            if os.path.exists(CALIB_FILE):
+                os.remove(CALIB_FILE)
+        except Exception:
+            pass
+        ts = datetime.now().strftime('%H:%M:%S')
+        self.controller.all_logs.append((ts, 'Action', 'Reset all calibrations'))
+        if "MainDashboard" in self.controller.frames:
+            subs = self.controller.frames["MainDashboard"].sub_frames
+            if "Logs" in subs:
+                subs["Logs"].refresh()
+        if self.current_node_id:
+            self._render_calibration_table(self.current_node_id)
+
+class GraphsView(ctk.CTkFrame):
+    name = "Graphs"
+    def __init__(self, parent, controller):
+        super().__init__(parent, fg_color="white", border_width=1, border_color="black")
+        self.controller = controller
+        ctk.CTkLabel(self, text="Saved Graphs", font=("Arial", 40, "bold")).pack(pady=5)
+        self.scroll = ctk.CTkScrollableFrame(self, corner_radius=0)
+        self.scroll.pack(fill="both", expand=True, padx=20, pady=20)
+        self.refresh()
+
+    def refresh(self):
+        for w in self.scroll.winfo_children():
+            w.destroy()
+        base = self.controller.csi_data_dir if hasattr(self.controller, 'csi_data_dir') else CSI_DATA_DIR
+        if not os.path.exists(base):
+            ctk.CTkLabel(self.scroll, text="No CSI data directory found.", font=("Arial",16)).pack(pady=20)
+            return
+        for node in sorted(os.listdir(base)):
+            node_dir = os.path.join(base, node)
+            if not os.path.isdir(node_dir):
+                continue
+            ctk.CTkLabel(self.scroll, text=node, font=("Arial",18,"bold")).pack(anchor="w", pady=(10,2))
+            for state in sorted(os.listdir(node_dir)):
+                state_dir = os.path.join(node_dir, state)
+                if not os.path.isdir(state_dir):
+                    continue
+                ctk.CTkLabel(self.scroll, text="  "+state, font=("Arial",16)).pack(anchor="w", padx=10)
+                files = sorted(glob.glob(os.path.join(state_dir, "*.csv")))
+                for f in files:
+                    b = ctk.CTkButton(self.scroll, text=os.path.basename(f), anchor="w",
+                                      command=lambda f=f: self.plot_file(f))
+                    b.pack(fill="x", padx=30, pady=2)
+
+    def plot_file(self, path):
+        df = pd.read_csv(path)
+        subcarrier_cols = [col for col in df.columns if col.startswith("SC_")]
+        if not subcarrier_cols:
+            subcarrier_cols = df.select_dtypes(include="number").columns.tolist()
+        if not subcarrier_cols:
+            return
+        mean_series = df[subcarrier_cols].mean(axis=1)
+        plt.figure(figsize=(10,4))
+        plt.plot(mean_series, label=os.path.basename(path))
+        plt.title(f"CSI Mean Signal {os.path.basename(path)}")
+        plt.xlabel("Sample Index")
+        plt.ylabel("Mean Amplitude")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+class SettingsView(ctk.CTkFrame):
+    name = "Settings"
+    def __init__(self, parent, controller):
+        super().__init__(parent, fg_color="white", border_width=1, border_color="black")
+        self.controller = controller
+        ctk.CTkLabel(self, text="Configuration", font=("Arial", 40, "bold")).pack(pady=10)
+        frm = ctk.CTkFrame(self, fg_color="transparent")
+        frm.pack(padx=30, pady=20)
+        # Broker
+        ctk.CTkLabel(frm, text="MQTT Broker:", font=("Arial", 16)).grid(row=0, column=0, sticky="w")
+        self.broker_entry = ctk.CTkEntry(frm, width=300)
+        self.broker_entry.grid(row=0, column=1, pady=5)
+        # Port
+        ctk.CTkLabel(frm, text="MQTT Port:", font=("Arial", 16)).grid(row=1, column=0, sticky="w")
+        self.port_entry = ctk.CTkEntry(frm, width=100)
+        self.port_entry.grid(row=1, column=1, pady=5)
+        # CSI dir
+        ctk.CTkLabel(frm, text="CSI Data Dir:", font=("Arial", 16)).grid(row=2, column=0, sticky="w")
+        self.csi_entry = ctk.CTkEntry(frm, width=300)
+        self.csi_entry.grid(row=2, column=1, pady=5)
+        # load current values
+        self._load_values()
+        ctk.CTkButton(self, text="Save", fg_color="#3b8ed0", command=self.save).pack(pady=10)
+
+    def _load_values(self):
+        conf = self.controller.config
+        self.broker_entry.delete(0, "end")
+        self.broker_entry.insert(0, conf.get("broker", ""))
+        self.port_entry.delete(0, "end")
+        self.port_entry.insert(0, str(conf.get("port", "")))
+        self.csi_entry.delete(0, "end")
+        self.csi_entry.insert(0, conf.get("csi_data_dir", ""))
+
+    def save(self):
+        self.controller.config["broker"] = self.broker_entry.get()
+        try:
+            self.controller.config["port"] = int(self.port_entry.get())
+        except ValueError:
+            pass
+        self.controller.config["csi_data_dir"] = self.csi_entry.get()
+        self.controller.csi_data_dir = self.controller.config["csi_data_dir"]
+        self.controller._save_config()
+        # restart MQTT client with new settings
+        try:
+            self.controller.client.disconnect()
+            self.controller.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+            self.controller.client.on_connect = self.controller.on_connect
+            self.controller.client.on_disconnect = self.controller.on_disconnect
+            self.controller.client.on_message = self.controller.on_message
+            self.controller.client.reconnect_delay_set(min_delay=1, max_delay=30)
+            self.controller.client.connect_async(self.controller.config.get("broker"), self.controller.config.get("port"), 60)
+            self.controller.client.loop_start()
+        except Exception as e:
+            print(f"WARNING: failed to restart mqtt with new config: {e}")
+        popup = ctk.CTkToplevel(self)
+        popup.title("Settings Saved")
+        popup.geometry("300x120")
+        ctk.CTkLabel(popup, text="Configuration saved.").pack(pady=20)
+        ctk.CTkButton(popup, text="OK", command=popup.destroy).pack(pady=8)
 
 class LogsView(ctk.CTkFrame):
     name = "Logs"
