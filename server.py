@@ -73,11 +73,34 @@ mqtt_client = mqtt.Client()
 def init_mqtt():
     mqtt_client.on_connect = on_mqtt_connect
     mqtt_client.on_message = on_mqtt_message
+    print(f"Initializing MQTT connection to {MQTT_BROKER}:{MQTT_PORT}")
     try:
         mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
         mqtt_client.loop_start()
     except Exception as e:
         print(f"MQTT setup warning: {e}")
+
+
+def publish_status_event(topic: str, payload: str, qos: int = 1) -> bool:
+    """Publish MQTT status payload with explicit error checking/logging."""
+    try:
+        info = mqtt_client.publish(topic, payload, qos=qos)
+    except Exception as e:
+        print(f"WARNING: MQTT publish exception topic={topic}: {e}")
+        return False
+
+    rc = getattr(info, "rc", mqtt.MQTT_ERR_UNKNOWN)
+    if rc != mqtt.MQTT_ERR_SUCCESS:
+        print(f"WARNING: MQTT publish failed topic={topic} rc={rc}")
+        return False
+
+    try:
+        if hasattr(info, "wait_for_publish"):
+            info.wait_for_publish()
+    except Exception as e:
+        print(f"WARNING: MQTT wait_for_publish error topic={topic}: {e}")
+
+    return True
 
 
 def _node_model_dir(node_id: str) -> str:
@@ -86,11 +109,20 @@ def _node_model_dir(node_id: str) -> str:
 
 @app.route('/model/<node_id>', methods=['GET'])
 def get_model(node_id):
-    path = os.path.join(_node_model_dir(node_id), "model.tflite")
-    if not os.path.exists(path):
-        return jsonify({"error": "model not found", "node": node_id}), 404
-    return send_file(path, mimetype="application/octet-stream", as_attachment=False)
+    # serve model file; allow either explicit filename or bare id
+    dirpath = _node_model_dir(node_id)
+    candidates = [os.path.join(dirpath, "model.tflite"), os.path.join(dirpath, node_id), os.path.join(dirpath, f"{node_id}.tflite")]
+    for path in candidates:
+        if os.path.exists(path):
+            return send_file(path, mimetype="application/octet-stream", as_attachment=False)
+    return jsonify({"error": "model not found", "node": node_id}), 404
 
+
+# alias that matches collaborator's '/static/models/<esp32_id>' pattern
+@app.route('/static/models/<node_id>', methods=['GET'])
+def download_model(node_id):
+    # behaviour identical to /model/<node_id>
+    return get_model(node_id)
 
 @app.route('/params/<node_id>', methods=['GET'])
 def get_scaler_params(node_id):
@@ -105,13 +137,28 @@ def upload_data():
     esp32_id = request.headers.get('X-ESP32-ID', '0')
     sub_batch_idx = int(request.headers.get('X-Sub-Batch-Index', -1))
     total_sub_batches = int(request.headers.get('X-Total-Sub-Batches', 0))
-    
+    session_hdr = request.headers.get('X-Session-ID')
+
     if sub_batch_idx < 0 or total_sub_batches <= 0:
         return "Invalid Headers", 400
 
+    # prefer explicit session header, fall back to active_sessions table
+    sess = session_hdr if session_hdr else None
     if room_state == 'unknown' and esp32_id in active_sessions:
-        room_state = active_sessions[esp32_id]
-        
+        info = active_sessions[esp32_id]
+        if isinstance(info, dict):
+            room_state = info.get('label', room_state)
+            if sess is None:
+                sess = info.get('session')
+        elif isinstance(info, str):
+            # backward compatibility for legacy in-memory state values
+            room_state = info
+
+    if sess is None:
+        sess = datetime.now().strftime('%Y%m%d%H%M%S')
+        # update active_sessions so subsequent batches match
+        active_sessions[esp32_id] = {"label": room_state, "session": sess}
+
     raw_data = request.get_data()
     
     # Validation: The ESP32 sends a buffer of SUB_BATCH_SIZE
@@ -127,7 +174,12 @@ def upload_data():
     
     # Path setup: Use a unique sub-directory for this session (handles multiple
     # collections from the same node/state running concurrently).
-    sess = active_sessions.get(esp32_id, {}).get("session", "default")
+    info = active_sessions.get(esp32_id)
+    if isinstance(info, dict):
+        sess = info.get("session", sess)
+    if not sess:
+        sess = datetime.now().strftime('%Y%m%d%H%M%S')
+
     session_dir = os.path.join(SAVE_DIR, esp32_id, room_state, sess)
     if not os.path.exists(session_dir):
         os.makedirs(session_dir)
@@ -168,12 +220,25 @@ def upload_data():
         # active_sessions stores a dict {"label":..., "session":...}
         # publish just the label string so dashboard doesn't receive a dict
         completed_label = room_state
-        if esp32_id in active_sessions and isinstance(active_sessions[esp32_id], dict):
-            completed_label = active_sessions[esp32_id].get("label", room_state)
-        mqtt_client.publish(
-            f"/sensors/{esp32_id}/status",
-            json.dumps({"event": "collection_complete", "label": completed_label, "session": sess})
-        )
+        if esp32_id in active_sessions:
+            info = active_sessions[esp32_id]
+            if isinstance(info, dict):
+                completed_label = info.get("label", room_state)
+            elif isinstance(info, str):
+                completed_label = info
+        payload = json.dumps({
+            "event": "collection_complete",
+            "label": completed_label,
+            "session": sess,
+            "source": "server",
+        })
+        if mqtt_client is not None:
+            print(f"Publishing collection_complete for {esp32_id} (session={sess})")
+            ok = publish_status_event(f"/sensors/{esp32_id}/status", payload, qos=1)
+            if not ok:
+                print(f"WARNING: publish collection_complete failed for {esp32_id} (session={sess})")
+        else:
+            print("WARNING: mqtt_client is None, cannot publish collection_complete")
         active_sessions.pop(esp32_id, None)
         
         print(f"SAVED: {final_filename} with {len(combined_df)} rows.")
