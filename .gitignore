@@ -1,2 +1,5 @@
 __pycache__/
 csi_data/
+.venv/
+PRD.md
+PROGRESS.md

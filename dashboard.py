@@ -8,11 +8,47 @@ import shutil
 import subprocess
 import sys
 import pandas as pd
-import matplotlib.pyplot as plt
+import traceback
+# matplotlib is only needed for ad‑hoc plotting; import lazily inside
+# the plotting helper functions so that any backend initialization happens
+# after the main Tk root is up.  This avoids sporadic segfaults on some
+# Windows/Tk builds.
 from datetime import datetime
 
 import threading
-import server
+
+# utility to enable mouse-wheel scrolling on CTkScrollableFrame widgets
+# (CustomTkinter doesn't wire this up by default).  We bind when the
+# cursor enters the frame and unbind on leave, mimicking native behavior.
+def _enable_mousewheel(widget):
+    """Enable mouse-wheel scrolling on the given scrollable frame.
+
+    Previous implementation used bind_all() which registered the handler on
+the entire application every time the pointer entered any scroll frame.  This
+quickly produced cascading events and even crashed Tk with recursion when the
+window was first shown.  We now bind directly to the widget, which is safe and
+sufficient for most cases.
+    """
+    def _on_mousewheel(event):
+        try:
+            # normalized delta for Windows (multiples of 120) and Linux
+            if event.delta:
+                step = int(-1 * (event.delta / 120))
+            elif event.num in (4, 5):
+                step = 1 if event.num == 5 else -1
+            else:
+                step = 0
+            if step:
+                widget.yview_scroll(step, "units")
+        except Exception:
+            # swallow any Tk errors; we don't want stray callbacks crashing the app
+            pass
+    # bind wheel events directly; they fire when widget has focus or under cursor
+    widget.bind("<MouseWheel>", _on_mousewheel)
+    widget.bind("<Button-4>", _on_mousewheel)  # linux
+    widget.bind("<Button-5>", _on_mousewheel)
+
+# server module is no longer imported; launch the ingest service separately
 
 # --- Global Config ---
 BROKER = "localhost"
@@ -20,14 +56,13 @@ PORT = 1883
 LOG_DIR = "mqtt_logs"
 CALIB_STATES = ["door_closed", "door_open", "person_standing"]
 
-# where CSI CSV batches are stored on the Pi; adjust if you move the server
-CSI_DATA_DIR = os.path.expanduser("~/edge-esp32/csi_data")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# default to local server output path; can still be overridden in Settings
+CSI_DATA_DIR = os.path.join(BASE_DIR, "csi_data")
 TRAINING_SCRIPT = os.path.join(BASE_DIR, "train_model.py")
 NOTEBOOK_TRAINING_FILE = os.path.join(BASE_DIR, "Edge_ML.ipynb")
 NOTEBOOK_MODEL_FILE = os.path.join(BASE_DIR, "model (1).tflite")
-SERVER_REPO_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "edge-esp32"))
-MODEL_STORE_DIR = os.path.join(SERVER_REPO_DIR, "model_store")
+MODEL_STORE_DIR = os.path.join(BASE_DIR, "model_store")
 
 # legacy behaviour: fall back to local directory if CSI_DATA_DIR doesn’t exist
 
@@ -68,9 +103,13 @@ class GovernanceApp(ctk.CTk):
         self.last_calib_choice = {}
         # remember which label we requested for each node so we can validate
         self.expected_calib = {}
+        # remember the active collection session per node for completion matching
+        self.expected_session = {}
         # thresholds removed; model now handles inference
         # model lifecycle per-node (True if latest model is trained/valid)
         self.model_state = {node_id: False for node_id in self.esp_nodes}
+        # prevent duplicate concurrent training triggers per node
+        self.training_in_progress = {node_id: False for node_id in self.esp_nodes}
         # latest inferred state per node (published by ESP)
         self.node_detected_state = {node_id: "" for node_id in self.esp_nodes}
         # configuration state
@@ -133,13 +172,17 @@ class GovernanceApp(ctk.CTk):
         # generate a simple session identifier (timestamp-based)
         session = datetime.now().strftime("%Y%m%d%H%M%S")
         payload = json.dumps({"label": label, "session": session})
-        # remember session in case we need to match later
-        self.expected_calib[node_id] = label
         for attempt in range(1, retries + 1):
             msg_info = self.client.publish(topic, payload, qos=1)
             if msg_info.rc == mqtt.MQTT_ERR_SUCCESS:
+                # only set expected values once publish actually succeeds
+                self.expected_calib[node_id] = label
+                self.expected_session[node_id] = session
                 return True
             time.sleep(0.2 * attempt)
+        # clear stale expectations if publish failed after all retries
+        self.expected_calib.pop(node_id, None)
+        self.expected_session.pop(node_id, None)
         return False
 
     def _mark_model_dirty(self, node_id):
@@ -147,8 +190,13 @@ class GovernanceApp(ctk.CTk):
             self.model_state[node_id] = False
             self._save_model_state()
 
-    def _send_model_to_esp(self, node_id, model_path, scaler_path):
-        # copy artifacts to server model store for HTTP serving
+    def _copy_model_to_server(self, node_id, model_path, scaler_path):
+        """Copy the trained artifacts into the server model store.
+
+        Returns True on success, False otherwise.  This does *not* notify the
+        ESP32; notification is handled separately so we can wait for an explicit
+        MQTT signal before the device ever attempts a download.
+        """
         node_dir = os.path.join(MODEL_STORE_DIR, node_id)
         os.makedirs(node_dir, exist_ok=True)
         model_dst = os.path.join(node_dir, "model.tflite")
@@ -156,12 +204,33 @@ class GovernanceApp(ctk.CTk):
         try:
             shutil.copy2(model_path, model_dst)
             shutil.copy2(scaler_path, scaler_dst)
+            return True
         except Exception as e:
             ts = datetime.now().strftime('%H:%M:%S')
             self.all_logs.append((ts, "Model", f"Artifact copy failed for {node_id}: {e}"))
             return False
 
-        # notify ESP to pull model + scaler via HTTP
+    def _notify_training_complete(self, node_id, session):
+        """Publish a training-complete command so the ESP can begin downloading."""
+        topic = f"/commands/{node_id}/training_complete"
+        payload = json.dumps({"session": session})
+        msg_info = self.client.publish(topic, payload, qos=1)
+        ts = datetime.now().strftime('%H:%M:%S')
+        if msg_info.rc == mqtt.MQTT_ERR_SUCCESS:
+            self.all_logs.append((ts, "Model", f"Notified {node_id} training_complete (session={session})"))
+            return True
+        else:
+            self.all_logs.append((ts, "Model", f"Failed to publish training_complete for {node_id}"))
+            return False
+
+    def _send_model_to_esp(self, node_id, model_path, scaler_path):
+        """Legacy helper used by manual flows: copy and then send update_model.
+
+        We keep this around for backwards compatibility (e.g. `trigger_collect`)
+        but dashboard.training now uses training_complete instead.
+        """
+        if not self._copy_model_to_server(node_id, model_path, scaler_path):
+            return False
         topic = f"/commands/{node_id}/update_model"
         session = datetime.now().strftime("%Y%m%d%H%M%S")
         payload = json.dumps({"session": session})
@@ -214,14 +283,21 @@ class GovernanceApp(ctk.CTk):
     # resize handler --------------------------------------------------
 
     def _on_resize(self, event):
-        # when window changes size, refresh current view so widgets re-layout
-        if self.last_view and self.last_view in self.frames:
-            frame = self.frames[self.last_view]
+        # when the main window is resized, force every view to re-layout
+        # itself.  older behaviour only touched the currently visible frame,
+        # which meant components in other tabs never updated and could appear
+        # clipped when the user returned to them.
+        for frame in self.frames.values():
             if hasattr(frame, "refresh"):
                 try:
                     frame.refresh()
                 except Exception:
                     pass
+        # ensure the geometry manager repositions everything
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
 
     # view state persistence ------------------------------------------
     def _save_view_state(self):
@@ -310,6 +386,7 @@ class GovernanceApp(ctk.CTk):
 
         completion_node = None
         completion_state = None
+        completion_session = None
 
         topic_parts = msg.topic.strip("/").split("/")
         if len(topic_parts) == 3 and topic_parts[0] == "sensors" and topic_parts[2] == "status":
@@ -339,6 +416,9 @@ class GovernanceApp(ctk.CTk):
                                 ci = int(cur)
                                 ti = int(total)
                                 cfg.set_progress(ci, ti)
+                                # if we've just reached the end, re-enable the start button
+                                if ci == ti and cfg.status_lbl_ref:
+                                    cfg.status_lbl_ref.configure(text="Status: Upload finished; awaiting server merge", text_color="#1a4d66")
                             except Exception:
                                 pass
                 elif evt == "ack":
@@ -357,7 +437,20 @@ class GovernanceApp(ctk.CTk):
                             cfg = subs.get("ESP32-C3 Configuration")
                             if cfg and cfg.current_node_id == node_id:
                                 try:
-                                    cfg.set_progress(int(sub), int(total))
+                                    si = int(sub)
+                                    ti = int(total)
+                                    cfg.set_progress(si, ti)
+                                    # fallback unlock path: allow next calibration when
+                                    # firmware confirms all uploads were sent, even if
+                                    # server merge-complete MQTT is delayed/missing.
+                                    if si >= ti:
+                                        if cfg.start_btn_ref:
+                                            cfg.start_btn_ref.configure(state="normal")
+                                        if cfg.status_lbl_ref:
+                                            cfg.status_lbl_ref.configure(
+                                                text="Status: Upload complete (server merge pending)",
+                                                text_color="#1a4d66"
+                                            )
                                 except Exception:
                                     pass
                 elif evt == "state_change":
@@ -365,21 +458,29 @@ class GovernanceApp(ctk.CTk):
                     if isinstance(state, str):
                         self.node_detected_state[node_id] = state
                         self.all_logs.append((ts, "State", f"{node_id} -> {state}"))
-                if payload_json.get("event") == "collection_complete":
+                elif evt == "collection_complete":
                     completion_node = node_id
                     completion_state = payload_json.get("label")
-                    if completion_node in self.esp_nodes:
-                        # labels should be strings; ignore others
-                        if isinstance(completion_state, str) and completion_state in self.esp_nodes[completion_node]:
-                            # ignore if we've already marked this state complete (avoid duplicate popups)
-                            if not self.esp_nodes[completion_node].get(completion_state):
-                                self.esp_nodes[completion_node][completion_state] = True
-                                # persist state immediately
-                                self._save_calib_states()
-                            else:
-                                # already recorded; clear so UI won't be notified
-                                completion_node = None
-                                completion_state = None
+                    completion_session = payload_json.get("session")
+                    completion_source = payload_json.get("source")
+                    if completion_node not in self.esp_nodes:
+                        completion_node = None
+                        completion_state = None
+                        completion_session = None
+                        completion_source = None
+                    elif not (isinstance(completion_state, str) and completion_state in self.esp_nodes[completion_node]):
+                        completion_node = None
+                        completion_state = None
+                        completion_session = None
+                        completion_source = None
+                elif evt == "model_ready":
+                    self.model_state[node_id] = True
+                    self._save_model_state()
+                    self.all_logs.append((ts, "Model", f"{node_id} reported model_ready"))
+                elif evt == "model_download_failed":
+                    self.model_state[node_id] = False
+                    self._save_model_state()
+                    self.all_logs.append((ts, "Model", f"{node_id} model download failed"))
             except json.JSONDecodeError:
                 pass
         
@@ -406,8 +507,12 @@ class GovernanceApp(ctk.CTk):
                 if "ESP32-C3 Configuration" in subs:
                     subs["ESP32-C3 Configuration"].refresh()
                 if completion_node and completion_state and "ESP32-C3 Configuration" in subs:
-                    subs["ESP32-C3 Configuration"].on_calibration_complete(completion_node, completion_state)
-                    # also log success/mismatch, the method itself handles the entry
+                    try:
+                        subs["ESP32-C3 Configuration"].on_calibration_complete(completion_node, completion_state, completion_session)
+                    except Exception as e:
+                        print("[DASHBOARD] on_calibration_complete exception")
+                        traceback.print_exc()
+                        self.all_logs.append((datetime.now().strftime("%H:%M:%S"), "Error", f"calibration callback failed: {e}"))
 
         self.after(0, refresh_ui)
 
@@ -479,28 +584,42 @@ class MainDashboard(ctk.CTkFrame):
         else:
             self.switch_view("Homepage")
 
-    def switch_view(self, name):
-        if self.controller.last_view == "ESP32-C3 Configuration":
+        self.after(2000, self._periodic_status_refresh)
+
+    def _periodic_status_refresh(self):
+        try:
             cfg = self.sub_frames.get("ESP32-C3 Configuration")
-            if cfg and cfg.current_node_id:
-                # delegate to controller method which handles persistence
-                if name == "Logout":
-                    self.controller.show_frame("LoginPage")
-        else:
-            for n, b in self.nav_btns.items():
-                b.configure(fg_color="#d9d9d9" if n == name else "white")
+            if cfg:
+                cfg._refresh_node_status_list()
+        except Exception:
+            pass
+        self.after(2000, self._periodic_status_refresh)
+
+    def switch_view(self, name):
+        # logout gets special handling regardless of current view
+        if name == "Logout":
+            self.controller.show_frame("LoginPage")
+            return
+
+        # update button highlights and raise requested frame
+        for n, b in self.nav_btns.items():
+            b.configure(fg_color="#d9d9d9" if n == name else "white")
+        if name in self.sub_frames:
             self.sub_frames[name].tkraise()
             if hasattr(self.sub_frames[name], "refresh"):
-                self.sub_frames[name].refresh()
-            # remember state
-            # store on controller instead of self
-            self.controller.last_view = name
-            if name == "ESP32-C3 Configuration":
-                cur = self.sub_frames[name].current_node_id
-                self.controller.last_node = cur
-            else:
-                self.controller.last_node = None
-            self.controller._save_view_state()
+                try:
+                    self.sub_frames[name].refresh()
+                except Exception:
+                    pass
+
+        # remember state for persistence
+        self.controller.last_view = name
+        if name == "ESP32-C3 Configuration":
+            cur = self.sub_frames[name].current_node_id
+            self.controller.last_node = cur
+        else:
+            self.controller.last_node = None
+        self.controller._save_view_state()
 
 # --- VIEWS ---
 
@@ -509,8 +628,9 @@ class HomeView(ctk.CTkFrame):
     def __init__(self, parent, controller):
         super().__init__(parent, fg_color="white", border_width=1, border_color="black")
         self.controller = controller
+        # use pack with expand so the container resizes with the window
         self.grid_container = ctk.CTkFrame(self, fg_color="transparent")
-        self.grid_container.place(relx=0.5, rely=0.5, anchor="center")
+        self.grid_container.pack(fill="both", expand=True)
         self.refresh()
 
     def refresh(self):
@@ -561,6 +681,7 @@ class KeyMgmtView(ctk.CTkFrame):
         
         self.scroll = ctk.CTkScrollableFrame(self, corner_radius=30, border_width=1, border_color="#1a4d66")
         self.scroll.pack(fill="both", expand=True, padx=30, pady=10)
+        _enable_mousewheel(self.scroll)
 
     def refresh(self):
         for w in self.scroll.winfo_children(): w.destroy()
@@ -600,6 +721,7 @@ class ESPConfigView(ctk.CTkFrame):
         
         node_scroll = ctk.CTkScrollableFrame(left, fg_color="transparent")
         node_scroll.pack(fill="both", expand=True, padx=10, pady=10)
+        _enable_mousewheel(node_scroll)
 
         self.bulk_selected = {}
         self.node_status_labels = {}
@@ -647,6 +769,9 @@ class ESPConfigView(ctk.CTkFrame):
         self.right = ctk.CTkScrollableFrame(main, border_width=1, border_color="black",
                                             corner_radius=30, fg_color="white")
         self.right.pack(side="right", fill="both", expand=True, padx=10, pady=10)
+        _enable_mousewheel(self.right)
+        # window‑level resize refresh is handled by the app's _on_resize
+        # (no need to bind individual Configure events here)
         
         self.detail_widgets = []
         self.calibration_table_widgets = []
@@ -756,6 +881,10 @@ class ESPConfigView(ctk.CTkFrame):
         self.detail_widgets.append(self.status_lbl_ref)
 
         self._render_calibration_table(node_id)
+        try:
+            self.right.update_idletasks()
+        except Exception:
+            pass
 
         btn_f = ctk.CTkFrame(self.right, fg_color="transparent")
         btn_f.pack(pady=20); self.detail_widgets.append(btn_f)
@@ -817,6 +946,23 @@ class ESPConfigView(ctk.CTkFrame):
             self.calibration_table_widgets.append(self.train_btn_ref)
             self.detail_widgets.append(self.train_btn_ref)
 
+    def _resolve_data_base(self):
+        configured = getattr(self.controller, "csi_data_dir", None)
+        candidates = []
+        if isinstance(configured, str) and configured.strip():
+            candidates.append(configured)
+        if isinstance(CSI_DATA_DIR, str) and CSI_DATA_DIR.strip():
+            candidates.append(CSI_DATA_DIR)
+        candidates.append("csi_data")
+
+        for path in candidates:
+            try:
+                if os.path.exists(path):
+                    return path
+            except Exception:
+                continue
+        return candidates[-1]
+
     def train_model(self, node_id):
         state_map = self.controller.esp_nodes.get(node_id, {})
         if not all(state_map.get(s, False) for s in CALIB_STATES):
@@ -827,7 +973,17 @@ class ESPConfigView(ctk.CTkFrame):
             ctk.CTkButton(popup, text="OK", width=90, command=popup.destroy).pack()
             return
 
-        data_base = self.controller.csi_data_dir if os.path.exists(self.controller.csi_data_dir) else (CSI_DATA_DIR if os.path.exists(CSI_DATA_DIR) else "csi_data")
+        if self.controller.training_in_progress.get(node_id, False):
+            ts = datetime.now().strftime('%H:%M:%S')
+            self.controller.all_logs.append((ts, "Model", f"Training already in progress for {node_id}"))
+            if self.status_lbl_ref:
+                self.status_lbl_ref.configure(text="Status: Training already in progress", text_color="#1a4d66")
+            return
+
+        self.controller.training_in_progress[node_id] = True
+
+        # pick a valid CSI directory, avoid NoneType
+        data_base = self._resolve_data_base()
         output_tmp_dir = os.path.join(MODEL_STORE_DIR, "_tmp", node_id)
         os.makedirs(output_tmp_dir, exist_ok=True)
         model_output = os.path.join(output_tmp_dir, "model.tflite")
@@ -844,8 +1000,21 @@ class ESPConfigView(ctk.CTkFrame):
             "--notebook-model", NOTEBOOK_MODEL_FILE,
         ]
 
+        # disable the train button to prevent re‑entry
+        if self.train_btn_ref:
+            self.train_btn_ref.configure(state="disabled")
+
         if self.status_lbl_ref:
             self.status_lbl_ref.configure(text=f"Status: Training model for {node_id}...", text_color="#1a4d66")
+
+        # show a simple progress popup while training runs
+        progress_popup = ctk.CTkToplevel(self)
+        progress_popup.title("Training in progress")
+        progress_popup.geometry("320x100")
+        ctk.CTkLabel(progress_popup, text="Training in progress, please wait...").pack(pady=20)
+
+        # helper to close later
+        training_popup_ref = progress_popup
 
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -855,7 +1024,35 @@ class ESPConfigView(ctk.CTkFrame):
         else:
             err = proc.stderr.strip() if proc.returncode != 0 else ""
 
+        # log stdout for additional visibility
+        if proc and proc.stdout:
+            for line in proc.stdout.splitlines():
+                if line.strip():
+                    ts = datetime.now().strftime('%H:%M:%S')
+                    self.controller.all_logs.append((ts, "Model", line.strip()))
+                    # also update status label with key info lines
+                    if "Dataset shape" in line or "Test loss" in line:
+                        if self.status_lbl_ref:
+                            self.status_lbl_ref.configure(text=line.strip(), text_color="#1a4d66")
+
+        # once subprocess finishes remove progress popup
+        try:
+            training_popup_ref.destroy()
+        except Exception:
+            pass
+
         if proc is None or proc.returncode != 0:
+            # dump output to terminal for immediate debugging
+            if proc:
+                print("[TRAINING] stdout:\n", proc.stdout)
+                print("[TRAINING] stderr:\n", proc.stderr)
+                # also add every line to the dashboard log so Logs tab shows it
+                for line in proc.stdout.splitlines():
+                    ts = datetime.now().strftime('%H:%M:%S')
+                    self.controller.all_logs.append((ts, "Model", line))
+                for line in proc.stderr.splitlines():
+                    ts = datetime.now().strftime('%H:%M:%S')
+                    self.controller.all_logs.append((ts, "Model", line))
             ts = datetime.now().strftime('%H:%M:%S')
             self.controller.all_logs.append((ts, "Model", f"Training failed for {node_id}: {err or 'unknown error'}"))
             if self.status_lbl_ref:
@@ -866,17 +1063,31 @@ class ESPConfigView(ctk.CTkFrame):
             ctk.CTkLabel(popup, text="Model training failed.", font=("Arial", 16, "bold")).pack(pady=(16, 8))
             ctk.CTkLabel(popup, text=err or "Check logs for details.", wraplength=440, text_color="gray").pack(pady=(0, 12))
             ctk.CTkButton(popup, text="OK", width=90, command=popup.destroy).pack()
+            # re-enable button
+            if self.train_btn_ref:
+                self.train_btn_ref.configure(state="normal")
+            self.controller.training_in_progress[node_id] = False
             return
 
-        sent = self.controller._send_model_to_esp(node_id, model_output, scaler_output)
-        if sent:
-            self.controller.model_state[node_id] = True
+        # training succeeded; copy artifacts to server and then notify ESP
+        copied = self.controller._copy_model_to_server(node_id, model_output, scaler_output)
+        if copied:
+            # generate a session id for notification
+            session = datetime.now().strftime("%Y%m%d%H%M%S")
+            self.controller.model_state[node_id] = False  # will be set true when ESP reports model_ready
             self.controller._save_model_state()
+            self.controller._notify_training_complete(node_id, session)
             if self.status_lbl_ref:
-                self.status_lbl_ref.configure(text="Status: Model trained and update requested", text_color="#2e7d32")
+                self.status_lbl_ref.configure(text="Status: Model trained; waiting for device to pull", text_color="#1a4d66")
         else:
+            ts = datetime.now().strftime('%H:%M:%S')
+            self.controller.all_logs.append((ts, "Model", f"Failed to copy model to server for {node_id}"))
             if self.status_lbl_ref:
-                self.status_lbl_ref.configure(text="Status: Model trained but notify failed", text_color="#d32f2f")
+                self.status_lbl_ref.configure(text="Status: Model trained but copy failed", text_color="#d32f2f")
+        # re-enable train button regardless of outcome
+        if self.train_btn_ref:
+            self.train_btn_ref.configure(state="normal")
+        self.controller.training_in_progress[node_id] = False
         if self.current_node_id == node_id:
             self._render_calibration_table(node_id)
 
@@ -886,8 +1097,18 @@ class ESPConfigView(ctk.CTkFrame):
         self.controller.last_calib_choice[node_id] = selected_state
         # any fresh calibration invalidates previously trained model
         self.controller._mark_model_dirty(node_id)
-        # record what we expect back
-        self.controller.expected_calib[node_id] = selected_state
+
+        # ensure a fresh dataset for each new calibration cycle
+        data_base = self._resolve_data_base()
+        state_dir = os.path.join(data_base, node_id, selected_state)
+        if os.path.isdir(state_dir):
+            try:
+                shutil.rmtree(state_dir)
+                ts = datetime.now().strftime('%H:%M:%S')
+                self.controller.all_logs.append((ts, "Model", f"Cleared old CSI data for {node_id}/{selected_state}"))
+            except Exception as e:
+                ts = datetime.now().strftime('%H:%M:%S')
+                self.controller.all_logs.append((ts, "Model", f"Failed to clear CSI data for {node_id}/{selected_state}: {e}"))
 
         # reset progress UI
         try:
@@ -936,7 +1157,18 @@ class ESPConfigView(ctk.CTkFrame):
         for node_id in selected_nodes:
             self.controller.last_calib_choice[node_id] = selected_state
             self.controller._mark_model_dirty(node_id)
-            self.controller.expected_calib[node_id] = selected_state
+
+            data_base = self._resolve_data_base()
+            state_dir = os.path.join(data_base, node_id, selected_state)
+            if os.path.isdir(state_dir):
+                try:
+                    shutil.rmtree(state_dir)
+                    ts = datetime.now().strftime('%H:%M:%S')
+                    self.controller.all_logs.append((ts, "Model", f"Cleared old CSI data for {node_id}/{selected_state}"))
+                except Exception as e:
+                    ts = datetime.now().strftime('%H:%M:%S')
+                    self.controller.all_logs.append((ts, "Model", f"Failed to clear CSI data for {node_id}/{selected_state}: {e}"))
+
             if self.controller._publish_collect_with_retry(node_id, selected_state, retries=3):
                 success_count += 1
             else:
@@ -961,7 +1193,8 @@ class ESPConfigView(ctk.CTkFrame):
         ctk.CTkLabel(popup, text=msg, font=("Arial", 13), justify="left").pack(pady=24)
         ctk.CTkButton(popup, text="OK", width=90, command=popup.destroy).pack()
 
-    def on_calibration_complete(self, node_id, state):
+    def on_calibration_complete(self, node_id, state, session=None):
+        expected_session = self.controller.expected_session.get(node_id)
         # if we previously sent a command, verify the returned label
         expected = self.controller.expected_calib.get(node_id)
         if expected is not None and expected != state:
@@ -975,32 +1208,117 @@ class ESPConfigView(ctk.CTkFrame):
                     self.start_btn_ref.configure(state="normal")
                 if self.status_lbl_ref:
                     self.status_lbl_ref.configure(text="Status: Idle", text_color="gray")
-            # clear expected label; require explicit retry from user
+            # clear expected values; require explicit retry from user
             self.controller.expected_calib.pop(node_id, None)
+            self.controller.expected_session.pop(node_id, None)
+            return
+
+        # validate completion session against expected session
+        if expected_session is not None and session and session != expected_session:
+            ts = datetime.now().strftime('%H:%M:%S')
+            self.controller.all_logs.append((
+                ts,
+                "Mismatch",
+                f"{node_id} session mismatch: got {session}, expected {expected_session}; event ignored"
+            ))
+            print(f"WARNING: node {node_id} reported session '{session}' but expected '{expected_session}'")
+            if self.current_node_id == node_id:
+                if self.start_btn_ref:
+                    self.start_btn_ref.configure(state="normal")
+                if self.status_lbl_ref:
+                    self.status_lbl_ref.configure(text="Status: Idle", text_color="gray")
+            self.controller.expected_calib.pop(node_id, None)
+            self.controller.expected_session.pop(node_id, None)
+            return
+
+        # ignore no-session fallback completions when we have no active expected session
+        if expected_session is None and not session:
+            ts = datetime.now().strftime('%H:%M:%S')
+            self.controller.all_logs.append((
+                ts,
+                "Model",
+                f"Ignored unsolicited firmware fallback completion for {node_id}/{state} (no active expected session)"
+            ))
+            self.controller.expected_calib.pop(node_id, None)
+            self.controller.expected_session.pop(node_id, None)
             return
 
         # either we had no expectation, or the labels match
-        if node_id in self.controller.esp_nodes:
-            self.controller.esp_nodes[node_id][state] = True
-            self.controller._save_calib_states()
+        # `completion_source` explicitly marks whether this event came from the server
+        # or from firmware fallback.  Server events are authoritative; firmware
+        # events are a best-effort unlock path.
+        if completion_source == "server":
+            server_complete = True
+        elif completion_source == "firmware":
+            server_complete = False
+        else:
+            server_complete = bool(completion_session)
 
-        # remove the stored expectation (if any)
+        was_done = self.controller.esp_nodes.get(node_id, {}).get(state, False)
+        newly_marked_done = False
+        if node_id in self.controller.esp_nodes and state in self.controller.esp_nodes[node_id]:
+            if not was_done:
+                self.controller.esp_nodes[node_id][state] = True
+                self.controller._save_calib_states()
+                newly_marked_done = True
+
+        ts = datetime.now().strftime('%H:%M:%S')
+        if server_complete:
+            self.controller.all_logs.append((
+                ts,
+                "Model",
+                f"Server merge complete for {node_id}/{state} (session={completion_session})"
+            ))
+        else:
+            fallback_desc = "firmware fallback" if completion_source == "firmware" else "no server session"
+            self.controller.all_logs.append((
+                ts,
+                "Model",
+                f"Firmware completion for {node_id}/{state} ({fallback_desc})"
+            ))
+
+        all_done = all(self.controller.esp_nodes[node_id].get(s, False) for s in CALIB_STATES)
+        if all_done and not self.controller.model_state.get(node_id, False) and not self.controller.training_in_progress.get(node_id, False):
+            self.controller.all_logs.append((ts, "Model", f"Auto-training triggered for {node_id}"))
+            if self.current_node_id == node_id and self.status_lbl_ref:
+                self.status_lbl_ref.configure(text=f"Status: Auto-training model for {node_id}...", text_color="#1a4d66")
+            popup = ctk.CTkToplevel(self)
+            popup.title("Auto Training")
+            popup.geometry("420x140")
+            ctk.CTkLabel(
+                popup,
+                text=f"All calibration states complete for {node_id}.\nStarting model training...",
+                font=("Arial", 14)
+            ).pack(pady=22)
+            ctk.CTkButton(popup, text="OK", width=90, command=popup.destroy).pack()
+            self.train_model(node_id)
+        elif all_done and self.controller.training_in_progress.get(node_id, False):
+            self.controller.all_logs.append((ts, "Model", f"Training already running for {node_id}; skipping duplicate trigger"))
+
+        # remove the stored expectations (if any)
         self.controller.expected_calib.pop(node_id, None)
+        self.controller.expected_session.pop(node_id, None)
 
         # if user has navigated away, no further UI changes needed
         if self.current_node_id != node_id:
             return
 
+        # unlock next calibration on either authoritative server complete or
+        # firmware fallback completion.
         if self.start_btn_ref:
             self.start_btn_ref.configure(state="normal")
         if self.status_lbl_ref:
-            self.status_lbl_ref.configure(text="Status: Idle", text_color="gray")
+            if server_complete:
+                self.status_lbl_ref.configure(text="Status: Idle", text_color="gray")
+            else:
+                self.status_lbl_ref.configure(text="Status: Idle (firmware fallback)", text_color="#1a4d66")
 
         self._render_calibration_table(node_id)
         # clear progress bar after completion
         if self.current_node_id == node_id and hasattr(self, 'progress_bar'):
             self.progress_bar.set(0)
-        self._show_calibration_popup(node_id, state)
+        if newly_marked_done:
+            self._show_calibration_popup(node_id, state)
 
     def _show_calibration_popup(self, node_id, state):
         popup = ctk.CTkToplevel(self)
@@ -1024,8 +1342,7 @@ class ESPConfigView(ctk.CTkFrame):
 
     def view_graph(self, node_id, state):
         # pick base directory dynamically; preference given to configured path
-        base = self.controller.csi_data_dir if hasattr(self.controller, 'csi_data_dir') and os.path.exists(self.controller.csi_data_dir) \
-               else (CSI_DATA_DIR if os.path.exists(CSI_DATA_DIR) else "csi_data")
+        base = self._resolve_data_base()
         state_dir = os.path.join(base, node_id, state)
         csv_files = glob.glob(os.path.join(state_dir, "*.csv"))
 
@@ -1053,6 +1370,9 @@ class ESPConfigView(ctk.CTkFrame):
             return
 
         mean_series = df[subcarrier_cols].mean(axis=1)
+
+        # import pyplot only when needed
+        import matplotlib.pyplot as plt
 
         plt.figure(figsize=(10, 4))
         plt.plot(mean_series, label=f"{node_id} - {state} mean")
@@ -1119,7 +1439,11 @@ class GraphsView(ctk.CTkFrame):
     def refresh(self):
         for w in self.scroll.winfo_children():
             w.destroy()
-        base = self.controller.csi_data_dir if hasattr(self.controller, 'csi_data_dir') else CSI_DATA_DIR
+        configured = getattr(self.controller, 'csi_data_dir', None)
+        if isinstance(configured, str) and configured.strip():
+            base = configured
+        else:
+            base = CSI_DATA_DIR
         if not os.path.exists(base):
             ctk.CTkLabel(self.scroll, text="No CSI data directory found.", font=("Arial",16)).pack(pady=20)
             return
@@ -1147,6 +1471,8 @@ class GraphsView(ctk.CTkFrame):
         if not subcarrier_cols:
             return
         mean_series = df[subcarrier_cols].mean(axis=1)
+        # import matplotlib lazily here too
+        import matplotlib.pyplot as plt
         plt.figure(figsize=(10,4))
         plt.plot(mean_series, label=os.path.basename(path))
         plt.title(f"CSI Mean Signal {os.path.basename(path)}")
@@ -1210,13 +1536,7 @@ class SettingsView(ctk.CTkFrame):
             self.controller.client.loop_start()
         except Exception as e:
             print(f"WARNING: failed to restart mqtt with new config: {e}")
-        # also update ingest server's MQTT configuration if it's running
-        try:
-            server.MQTT_BROKER = self.controller.config.get("broker", server.MQTT_BROKER)
-            server.MQTT_PORT = self.controller.config.get("port", server.MQTT_PORT)
-            server.init_mqtt()
-        except Exception as e:
-            print(f"WARNING: failed to reinit server mqtt: {e}")
+        # note: ingest server is now decoupled; make sure to restart it manually
         popup = ctk.CTkToplevel(self)
         popup.title("Settings Saved")
         popup.geometry("300x120")
@@ -1242,8 +1562,8 @@ class LogsView(ctk.CTkFrame):
 
 if __name__ == "__main__":
     app = GovernanceApp()
-    # configure server to use the same broker settings as the dashboard
-    server.MQTT_BROKER = app.config.get("broker", server.MQTT_BROKER)
-    server.MQTT_PORT = app.config.get("port", server.MQTT_PORT)
-    threading.Thread(target=server.start_server, daemon=True).start()
+    # the ingest server is now started separately; run `python server.py` in
+    # another terminal before launching the dashboard if you want HTTP/MQTT
+    # services available.  the dashboard itself will still function for
+    # key governance and local status displays.
     app.mainloop()
