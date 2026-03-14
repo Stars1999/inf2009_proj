@@ -387,6 +387,7 @@ class GovernanceApp(ctk.CTk):
         completion_node = None
         completion_state = None
         completion_session = None
+        completion_source = None
 
         topic_parts = msg.topic.strip("/").split("/")
         if len(topic_parts) == 3 and topic_parts[0] == "sensors" and topic_parts[2] == "status":
@@ -508,7 +509,12 @@ class GovernanceApp(ctk.CTk):
                     subs["ESP32-C3 Configuration"].refresh()
                 if completion_node and completion_state and "ESP32-C3 Configuration" in subs:
                     try:
-                        subs["ESP32-C3 Configuration"].on_calibration_complete(completion_node, completion_state, completion_session)
+                        subs["ESP32-C3 Configuration"].on_calibration_complete(
+                            completion_node,
+                            completion_state,
+                            completion_session,
+                            completion_source,
+                        )
                     except Exception as e:
                         print("[DASHBOARD] on_calibration_complete exception")
                         traceback.print_exc()
@@ -840,11 +846,21 @@ class ESPConfigView(ctk.CTkFrame):
         default_choice = self.controller.last_calib_choice.get(node_id, "door_closed")
         self.radio_var = ctk.StringVar(value=default_choice)
 
-        # Hardcoded static values
+        # Dynamic values
+        node_state = self.controller.node_detected_state.get(node_id, "")
+        if node_state == "door_closed":
+            door_status = "CLOSE"
+        elif node_state == "door_open":
+            door_status = "OPEN"
+        elif node_state == "person_standing":
+            door_status = "PERSON PRESENT"
+        else:
+            door_status = "UNKNOWN"
+
         fields = [
             ("Node Number:", node_id),
             ("Connection:", "UP" if self.controller.node_online.get(node_id, False) else "DOWN"),
-            ("Door Status:", "CLOSE")
+            ("Door Status:", door_status)
         ]
 
         for lbl, val in fields:
@@ -955,13 +971,21 @@ class ESPConfigView(ctk.CTkFrame):
             candidates.append(CSI_DATA_DIR)
         candidates.append("csi_data")
 
+        # Prefer existing directories; fall back to a sane default.
         for path in candidates:
             try:
-                if os.path.exists(path):
+                if path and os.path.exists(path):
                     return path
             except Exception:
                 continue
-        return candidates[-1]
+
+        # If nothing exists, ensure we still return a usable path.
+        fallback = candidates[-1] if candidates else "csi_data"
+        try:
+            os.makedirs(fallback, exist_ok=True)
+        except Exception:
+            pass
+        return fallback
 
     def train_model(self, node_id):
         state_map = self.controller.esp_nodes.get(node_id, {})
@@ -1100,7 +1124,18 @@ class ESPConfigView(ctk.CTkFrame):
 
         # ensure a fresh dataset for each new calibration cycle
         data_base = self._resolve_data_base()
-        state_dir = os.path.join(data_base, node_id, selected_state)
+        if not isinstance(data_base, (str, os.PathLike)) or not data_base:
+            ts = datetime.now().strftime('%H:%M:%S')
+            self.controller.all_logs.append((ts, "Model", f"Invalid CSI base directory: {data_base!r}"))
+            popup = ctk.CTkToplevel(self)
+            popup.title("Calibration error")
+            popup.geometry("420x160")
+            ctk.CTkLabel(popup, text="Cannot determine CSI data directory.", font=("Arial", 14, "bold")).pack(pady=(16, 8))
+            ctk.CTkLabel(popup, text="Please configure a valid CSI data directory in Settings.", wraplength=400, text_color="gray").pack(pady=(0, 12))
+            ctk.CTkButton(popup, text="OK", width=90, command=popup.destroy).pack()
+            return
+
+        state_dir = os.path.join(str(data_base), str(node_id), str(selected_state))
         if os.path.isdir(state_dir):
             try:
                 shutil.rmtree(state_dir)
@@ -1193,8 +1228,10 @@ class ESPConfigView(ctk.CTkFrame):
         ctk.CTkLabel(popup, text=msg, font=("Arial", 13), justify="left").pack(pady=24)
         ctk.CTkButton(popup, text="OK", width=90, command=popup.destroy).pack()
 
-    def on_calibration_complete(self, node_id, state, session=None):
+    def on_calibration_complete(self, node_id, state, session=None, source=None):
         expected_session = self.controller.expected_session.get(node_id)
+        completion_source = source
+        completion_session = session
         # if we previously sent a command, verify the returned label
         expected = self.controller.expected_calib.get(node_id)
         if expected is not None and expected != state:
