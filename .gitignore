@@ -10,3 +10,18 @@ model_store/RACK_1/model.tflite
 model_store/RACK_1/scaler_params.json
 models.json
 view_state.json
+
+# Environment variables — never commit real credentials
+.env
+
+# Temporary / in-progress model artefacts
+model_store/_tmp/
+
+# Log files
+*.log
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db

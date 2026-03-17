@@ -4,10 +4,16 @@ import pandas as pd
 import os
 import glob
 import json
+import threading
+import time
+import zlib
 import paho.mqtt.client as mqtt
 from datetime import datetime
+from dotenv import load_dotenv
 
 app = Flask(__name__)
+
+load_dotenv()
 
 # --- CONFIGURATION (Must match ESP32 exactly) ---
 MAX_LOWER = 4
@@ -20,8 +26,8 @@ SUB_BATCH_SIZE = 40
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SAVE_DIR = os.path.join(BASE_DIR, "csi_data")
 MODEL_STORE_DIR = os.path.join(BASE_DIR, "model_store")
-MQTT_BROKER = "localhost"
-MQTT_PORT = 1883
+MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 
 os.makedirs(MODEL_STORE_DIR, exist_ok=True)
 os.makedirs(SAVE_DIR, exist_ok=True)
@@ -33,6 +39,18 @@ CSI_HEADERS = [f"SC_{i}" for i in range(MAX_LOWER, MAX_UPPER + 1) if i != DC_NUL
 # match firmware definition: ACTIVE_SUBCARRIERS = (MAX_UPPER - MAX_LOWER) with DC excluded
 SUB_COUNT = len(CSI_HEADERS)
 active_sessions = {}
+# The idempotency cache is used to detect retries of the same logical upload.
+# It grows with every new (session, sub-batch) combination until the cleanup
+# thread evicts old entries. In a typical deployment this should remain small
+# (e.g., <1000 keys) because each collection has only a handful of sub-batches,
+# and entries expire quickly.
+_seen_idempotency_keys: dict[str, tuple[float, int]] = {}  # key -> (timestamp, payload_crc)
+
+# Protect access to shared structures used by Flask request threads + the cleanup thread
+_active_sessions_lock = threading.Lock()
+
+# How long to keep the idempotency keys in memory before evicting them
+IDEMPOTENCY_TTL_SECONDS = 600  # 10 minutes
 
 
 def on_mqtt_connect(client, userdata, flags, rc):
@@ -63,7 +81,8 @@ def on_mqtt_message(client, userdata, message):
         if sess is None or not isinstance(sess, str) or not sess:
             # generate simple session id based on timestamp
             sess = datetime.now().strftime("%Y%m%d%H%M%S")
-        active_sessions[node_id] = {"label": label, "session": sess}
+        with _active_sessions_lock:
+            active_sessions[node_id] = {"label": label, "session": sess, "created_at": datetime.now().timestamp()}
         print(f"Collection command received: node={node_id}, label={label}, session={sess}")
 
 
@@ -110,11 +129,23 @@ def _node_model_dir(node_id: str) -> str:
 @app.route('/model/<node_id>', methods=['GET'])
 def get_model(node_id):
     # serve model file; allow either explicit filename or bare id
+    client_ip = request.remote_addr
+    print(f"[MODEL DOWNLOAD] {client_ip} requesting model for {node_id}")
     dirpath = _node_model_dir(node_id)
-    candidates = [os.path.join(dirpath, "model.tflite"), os.path.join(dirpath, node_id), os.path.join(dirpath, f"{node_id}.tflite")]
+    candidates = [
+        os.path.join(dirpath, "model.tflite"),
+        os.path.join(dirpath, node_id),
+        os.path.join(dirpath, f"{node_id}.tflite"),
+    ]
     for path in candidates:
         if os.path.exists(path):
+            try:
+                size = os.path.getsize(path)
+                print(f"[MODEL DOWNLOAD] Serving {path} ({size} bytes) to {client_ip}")
+            except Exception:
+                pass
             return send_file(path, mimetype="application/octet-stream", as_attachment=False)
+    print(f"[MODEL DOWNLOAD] Model not found for {node_id} (searched {candidates})")
     return jsonify({"error": "model not found", "node": node_id}), 404
 
 
@@ -126,9 +157,17 @@ def download_model(node_id):
 
 @app.route('/params/<node_id>', methods=['GET'])
 def get_scaler_params(node_id):
+    client_ip = request.remote_addr
+    print(f"[SCALER DOWNLOAD] {client_ip} requesting scaler params for {node_id}")
     path = os.path.join(_node_model_dir(node_id), "scaler_params.json")
     if not os.path.exists(path):
+        print(f"[SCALER DOWNLOAD] scaler params not found for {node_id} (expected {path})")
         return jsonify({"error": "scaler params not found", "node": node_id}), 404
+    try:
+        size = os.path.getsize(path)
+        print(f"[SCALER DOWNLOAD] Serving {path} ({size} bytes) to {client_ip}")
+    except Exception:
+        pass
     return send_file(path, mimetype="application/json", as_attachment=False)
 
 @app.route('/upload_data', methods=['POST'])
@@ -138,14 +177,16 @@ def upload_data():
     sub_batch_idx = int(request.headers.get('X-Sub-Batch-Index', -1))
     total_sub_batches = int(request.headers.get('X-Total-Sub-Batches', 0))
     session_hdr = request.headers.get('X-Session-ID')
+    idem_key = request.headers.get('X-Idempotency-Key')
 
     if sub_batch_idx < 0 or total_sub_batches <= 0:
         return "Invalid Headers", 400
 
     # prefer explicit session header, fall back to active_sessions table
     sess = session_hdr if session_hdr else None
-    if room_state == 'unknown' and esp32_id in active_sessions:
-        info = active_sessions[esp32_id]
+    if room_state == 'unknown':
+        with _active_sessions_lock:
+            info = active_sessions.get(esp32_id)
         if isinstance(info, dict):
             room_state = info.get('label', room_state)
             if sess is None:
@@ -157,10 +198,32 @@ def upload_data():
     if sess is None:
         sess = datetime.now().strftime('%Y%m%d%H%M%S')
         # update active_sessions so subsequent batches match
-        active_sessions[esp32_id] = {"label": room_state, "session": sess}
+        with _active_sessions_lock:
+            active_sessions[esp32_id] = {"label": room_state, "session": sess, "created_at": datetime.now().timestamp()}
 
     raw_data = request.get_data()
-    
+
+    # CRC32 integrity check
+    computed_crc = zlib.crc32(raw_data) & 0xFFFFFFFF
+    crc_header = request.headers.get('X-CRC32')
+    if crc_header:
+        try:
+            received_crc = int(crc_header, 16)
+        except ValueError:
+            return "Invalid CRC header", 400
+        if computed_crc != received_crc:
+            return f"CRC mismatch: got {crc_header}, expected {computed_crc:08x}", 422
+
+    # Idempotency: if we already processed this chunk, ensure payload matches
+    if idem_key:
+        with _active_sessions_lock:
+            entry = _seen_idempotency_keys.get(idem_key)
+        if entry is not None:
+            _, stored_crc = entry
+            if stored_crc == computed_crc:
+                return jsonify({"status": "duplicate", "accepted": False}), 200
+            return jsonify({"status": "conflict", "accepted": False, "reason": "payload mismatch"}), 409
+
     # Validation: The ESP32 sends a buffer of SUB_BATCH_SIZE
     expected_size = SUB_BATCH_SIZE * SUB_COUNT
     
@@ -168,13 +231,19 @@ def upload_data():
         print(f"DATA MISMATCH: Received {len(raw_data)}, expected {expected_size}")
         return "Wrong Size", 400
 
+    # Register this idempotency key now that the payload is valid
+    if idem_key:
+        with _active_sessions_lock:
+            _seen_idempotency_keys[idem_key] = (time.time(), computed_crc)
+
     # Reshape binary data to DataFrame
     csi_matrix = np.frombuffer(raw_data, dtype=np.uint8).reshape(SUB_BATCH_SIZE, SUB_COUNT)
     df = pd.DataFrame(csi_matrix, columns=CSI_HEADERS)
     
     # Path setup: Use a unique sub-directory for this session (handles multiple
     # collections from the same node/state running concurrently).
-    info = active_sessions.get(esp32_id)
+    with _active_sessions_lock:
+        info = active_sessions.get(esp32_id)
     if isinstance(info, dict):
         sess = info.get("session", sess)
     if not sess:
@@ -220,12 +289,12 @@ def upload_data():
         # active_sessions stores a dict {"label":..., "session":...}
         # publish just the label string so dashboard doesn't receive a dict
         completed_label = room_state
-        if esp32_id in active_sessions:
-            info = active_sessions[esp32_id]
-            if isinstance(info, dict):
-                completed_label = info.get("label", room_state)
-            elif isinstance(info, str):
-                completed_label = info
+        with _active_sessions_lock:
+            info = active_sessions.get(esp32_id)
+        if isinstance(info, dict):
+            completed_label = info.get("label", room_state)
+        elif isinstance(info, str):
+            completed_label = info
         payload = json.dumps({
             "event": "collection_complete",
             "label": completed_label,
@@ -239,16 +308,73 @@ def upload_data():
                 print(f"WARNING: publish collection_complete failed for {esp32_id} (session={sess})")
         else:
             print("WARNING: mqtt_client is None, cannot publish collection_complete")
-        active_sessions.pop(esp32_id, None)
+        with _active_sessions_lock:
+            active_sessions.pop(esp32_id, None)
         
         print(f"SAVED: {final_filename} with {len(combined_df)} rows.")
     
     return "OK", 200
 
-def start_server(host='0.0.0.0', port=5000):
+_cleanup_thread_started = False
+_cleanup_thread_lock = threading.Lock()
+
+
+def start_server(host=os.getenv("SERVER_HOST", "0.0.0.0"), port=int(os.getenv("SERVER_PORT", "5000"))):
+    # Ensure the background cleanup thread is running before we start serving.
+    _start_cleanup_thread()
+
     # initialize MQTT with whatever broker/port have been configured
     init_mqtt()
-    app.run(host=host, port=port, debug=True, use_reloader=False)
+
+    # Debug mode can be enabled via environment variable for development.
+    debug = os.getenv("FLASK_DEBUG", "false").lower() in ("1", "true", "yes")
+    app.run(host=host, port=port, debug=debug, use_reloader=debug)
+
+
+def _cleanup_stale_entries(session_ttl_seconds: int = 1800, interval_seconds: int = 300):
+    """Background thread: evict stale sessions and idempotency keys.
+
+    By default, sessions are considered stale after 30 minutes (1800 seconds),
+    and cleanup runs every 5 minutes (300 seconds). These values balance the
+    need to avoid unbounded in-memory growth with tolerating intermittent
+    reconnects and retries from devices.
+
+    This function is designed to run forever in a daemon thread. Exceptions
+    are caught and logged to prevent the thread from silently dying.
+    """
+    while True:
+        try:
+            time.sleep(interval_seconds)
+            now = datetime.now().timestamp()
+
+            # Evict old session entries
+            cutoff = now - session_ttl_seconds
+            with _active_sessions_lock:
+                stale_sessions = [
+                    k for k, v in active_sessions.items()
+                    if isinstance(v, dict) and v.get("created_at", float("inf")) < cutoff
+                ]
+                for k in stale_sessions:
+                    active_sessions.pop(k, None)
+                    print(f"[TTL] Evicted stale session: {k}")
+
+                # Evict old idempotency keys
+                idem_cutoff = now - IDEMPOTENCY_TTL_SECONDS
+                stale_idems = [k for k, v in _seen_idempotency_keys.items() if v[0] < idem_cutoff]
+                for k in stale_idems:
+                    _seen_idempotency_keys.pop(k, None)
+        except Exception as e:
+            print(f"[TTL] cleanup error: {e}")
+
+
+def _start_cleanup_thread():
+    global _cleanup_thread_started
+    with _cleanup_thread_lock:
+        if _cleanup_thread_started:
+            return
+        _cleanup_thread_started = True
+    threading.Thread(target=_cleanup_stale_entries, daemon=True).start()
+
 
 if __name__ == '__main__':
     start_server()

@@ -1,11 +1,14 @@
+import os
 import time
 import paho.mqtt.client as mqtt
+from dotenv import load_dotenv
 
-BROKER = "localhost"      # change to your broker IP/host
-PORT = 1883
+load_dotenv()
+
+BROKER = os.getenv("MQTT_BROKER", "localhost")      # change to your broker IP/host
+PORT = int(os.getenv("MQTT_PORT", "1883"))
 TOPIC = "test"
 
-import paho.mqtt.client as mqtt
 from paho.mqtt.client import CallbackAPIVersion
 
 client = mqtt.Client(CallbackAPIVersion.VERSION1, client_id="log-simulator")

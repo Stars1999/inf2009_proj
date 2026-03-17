@@ -11,11 +11,28 @@ cd inf2009_proj
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-pip install flask numpy pandas paho-mqtt customtkinter scikit-learn tensorflow
+pip install -r requirements.txt
 ```
 
-No separate requirements file is used; the packages installed above are all that
-are needed by `dashboard.py`, `server.py`, and the helper scripts.
+## Configuration
+
+Copy `.env.example` to `.env` and fill in your values:
+
+```bash
+cp .env.example .env
+# edit .env — set MQTT_BROKER to your Pi's IP or localhost
+```
+
+Key variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `MQTT_BROKER` | `localhost` | MQTT broker hostname / IP |
+| `MQTT_PORT` | `1883` | MQTT broker port |
+| `SERVER_HOST` | `0.0.0.0` | Flask ingest server bind address |
+| `SERVER_PORT` | `5000` | Flask ingest server port |
+| `MODEL_STORE_DIR` | `model_store` | Directory where trained models are saved |
+| `CSI_DATA_DIR` | `csi_data` | Directory where CSI CSVs are written |
 
 ## Running
 
@@ -30,6 +47,8 @@ python dashboard.py    # terminal 2: UI + MQTT orchestration
 
 `Edge_ML.ipynb` is kept as the reference notebook for feature selection,
 normalization, model architecture, and TFLite conversion.
+
+The canonical training script is the repository-root `train_model.py`.
 
 `dashboard.py` calls `train_model.py` after calibration is complete. You can
 also run it manually:

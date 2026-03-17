@@ -16,6 +16,7 @@ import traceback
 from datetime import datetime
 
 import threading
+from dotenv import load_dotenv
 
 # utility to enable mouse-wheel scrolling on CTkScrollableFrame widgets
 # (CustomTkinter doesn't wire this up by default).  We bind when the
@@ -50,9 +51,11 @@ sufficient for most cases.
 
 # server module is no longer imported; launch the ingest service separately
 
+load_dotenv()
+
 # --- Global Config ---
-BROKER = "localhost"
-PORT = 1883
+BROKER = os.getenv("MQTT_BROKER", "localhost")
+PORT = int(os.getenv("MQTT_PORT", "1883"))
 LOG_DIR = "mqtt_logs"
 CALIB_STATES = ["door_closed", "door_open", "person_standing"]
 
@@ -74,6 +77,9 @@ KEYS_FILE = "keys.json"                    # issued/in vault status
 VIEW_FILE = "view_state.json"              # last page/node
 MODEL_FILE = "models.json"                # per-node model validity flag
 ONLINE_TTL_SECONDS = 60
+# Only display 'last seen' timestamps after a short grace period to avoid
+# flickering during brief heartbeat gaps.
+LAST_SEEN_DISPLAY_THRESHOLD = 10  # seconds
 
 
 if not os.path.exists(LOG_DIR):
@@ -141,6 +147,9 @@ class GovernanceApp(ctk.CTk):
         # refresh on resize so child views can redraw properly
         self.bind("<Configure>", self._on_resize)
 
+        # periodic liveness check to keep connection status accurate
+        self.after(2000, self._liveness_tick)
+
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         self.client.on_connect = self.on_connect
         self.client.on_disconnect = self.on_disconnect
@@ -166,6 +175,22 @@ class GovernanceApp(ctk.CTk):
         # mark nodes offline until fresh status messages arrive
         for node_id in self.node_online:
             self.node_online[node_id] = False
+
+    def _liveness_tick(self):
+        """Periodic check to expire nodes that have stopped reporting."""
+        now = time.time()
+        changed = False
+        for node_id in list(self.node_online.keys()):
+            last = self.node_last_seen.get(node_id, 0)
+            if self.node_online.get(node_id, False) and (now - last) > 15:
+                self.node_online[node_id] = False
+                changed = True
+        # Refresh the config view if status changed (e.g. connection went down)
+        if changed and self.last_view == "ESP32-C3 Configuration":
+            cfg = self.frames.get("MainDashboard").sub_frames.get("ESP32-C3 Configuration")
+            if cfg and cfg.current_node_id:
+                cfg.refresh()
+        self.after(3000, self._liveness_tick)
 
     def _publish_collect_with_retry(self, node_id, label, retries=3):
         topic = f"/commands/{node_id}/collect"
@@ -478,10 +503,22 @@ class GovernanceApp(ctk.CTk):
                     self.model_state[node_id] = True
                     self._save_model_state()
                     self.all_logs.append((ts, "Model", f"{node_id} reported model_ready"))
+                    if self.current_node_id == node_id:
+                        self._safe_configure(
+                            self.status_lbl_ref,
+                            text="Status: Model ready on device",
+                            text_color="#2e7d32"
+                        )
                 elif evt == "model_download_failed":
                     self.model_state[node_id] = False
                     self._save_model_state()
                     self.all_logs.append((ts, "Model", f"{node_id} model download failed"))
+                    if self.current_node_id == node_id:
+                        self._safe_configure(
+                            self.status_lbl_ref,
+                            text="Status: Model download failed (check ESP logs)",
+                            text_color="red"
+                        )
             except json.JSONDecodeError:
                 pass
         
@@ -596,7 +633,7 @@ class MainDashboard(ctk.CTkFrame):
         try:
             cfg = self.sub_frames.get("ESP32-C3 Configuration")
             if cfg:
-                cfg._refresh_node_status_list()
+                cfg.refresh()
         except Exception:
             pass
         self.after(2000, self._periodic_status_refresh)
@@ -793,11 +830,87 @@ class ESPConfigView(ctk.CTkFrame):
         self.placeholder.pack(pady=20)
 
     def refresh(self):
-        # when the frame is raised, make sure the table reflects the current
-        # saved state for whatever node is selected
+        # when the frame is raised, make sure the UI reflects the current state
+        # (node status, connection, door state, calibration table)
         self._refresh_node_status_list()
         if self.current_node_id:
-            self._render_calibration_table(self.current_node_id)
+            self._update_right_panel(self.current_node_id)
+
+    def _ask_yes_no(self, title: str, message: str) -> bool:
+        """Show a modal yes/no dialog and return True if user confirms."""
+        popup = ctk.CTkToplevel(self)
+        popup.title(title)
+        popup.geometry("420x170")
+        popup.transient(self)
+        popup.lift()
+        popup.focus_force()
+
+        result = {"ok": False}
+
+        def _yes():
+            result["ok"] = True
+            popup.destroy()
+
+        def _no():
+            popup.destroy()
+
+        popup.protocol("WM_DELETE_WINDOW", _no)
+
+        ctk.CTkLabel(popup, text=message, wraplength=400, justify="left").pack(pady=(16, 10), padx=20)
+
+        btn_frame = ctk.CTkFrame(popup, fg_color="transparent")
+        btn_frame.pack(pady=(0, 16))
+        ctk.CTkButton(btn_frame, text="Yes", width=90, command=_yes).pack(side="left", padx=8)
+        ctk.CTkButton(btn_frame, text="No", width=90, command=_no).pack(side="left", padx=8)
+
+        popup.grab_set()
+        self.wait_window(popup)
+        return result["ok"]
+
+    def _ask_calibration_mode(self, node_id: str) -> str:
+        """Ask user whether to replace one state or reset all calibration states."""
+        popup = ctk.CTkToplevel(self)
+        popup.title("Calibration conflict")
+        popup.geometry("480x200")
+        popup.transient(self)
+        popup.lift()
+        popup.focus_force()
+
+        result = {"choice": "cancel"}
+
+        def _replace():
+            result["choice"] = "replace"
+            popup.destroy()
+
+        def _reset():
+            result["choice"] = "reset"
+            popup.destroy()
+
+        def _cancel():
+            popup.destroy()
+
+        popup.protocol("WM_DELETE_WINDOW", _cancel)
+
+        ctk.CTkLabel(
+            popup,
+            text=(
+                f"Node {node_id} already has some calibrations stored.\n"
+                "Choose whether to replace the current state or reset all states.\n"
+                "(Resetting clears all three states and starts fresh.)"
+            ),
+            wraplength=440,
+            justify="left"
+        ).pack(pady=(16, 10), padx=20)
+
+        btn_frame = ctk.CTkFrame(popup, fg_color="transparent")
+        btn_frame.pack(pady=(0, 16))
+        ctk.CTkButton(btn_frame, text="Replace state", width=140, command=_replace).pack(side="left", padx=8)
+        ctk.CTkButton(btn_frame, text="Reset all", width=120, command=_reset).pack(side="left", padx=8)
+        ctk.CTkButton(btn_frame, text="Cancel", width=100, command=_cancel).pack(side="left", padx=8)
+
+        popup.grab_set()
+        self.wait_window(popup)
+        return result["choice"]
 
     def _refresh_node_status_list(self):
         now = time.time()
@@ -857,18 +970,38 @@ class ESPConfigView(ctk.CTkFrame):
         else:
             door_status = "UNKNOWN"
 
-        fields = [
-            ("Node Number:", node_id),
-            ("Connection:", "UP" if self.controller.node_online.get(node_id, False) else "DOWN"),
-            ("Door Status:", door_status)
-        ]
+        # Store references to these labels so we can update them dynamically
+        self.node_number_label = None
+        self.connection_label = None
+        self.last_seen_label = None
+        self.door_status_label = None
 
-        for lbl, val in fields:
-            f = ctk.CTkFrame(self.right, fg_color="transparent")
-            f.pack(fill="x", padx=30, pady=8)
-            self.detail_widgets.append(f)
-            ctk.CTkLabel(f, text=lbl, text_color="black", font=("Arial", 16)).pack(side="left")
-            ctk.CTkLabel(f, text=val, text_color="gray").pack(side="right")
+        f = ctk.CTkFrame(self.right, fg_color="transparent")
+        f.pack(fill="x", padx=30, pady=8)
+        self.detail_widgets.append(f)
+        ctk.CTkLabel(f, text="Node Number:", text_color="black", font=("Arial", 16)).pack(side="left")
+        self.node_number_label = ctk.CTkLabel(f, text=node_id, text_color="gray")
+        self.node_number_label.pack(side="right")
+
+        f = ctk.CTkFrame(self.right, fg_color="transparent")
+        f.pack(fill="x", padx=30, pady=8)
+        self.detail_widgets.append(f)
+        ctk.CTkLabel(f, text="Connection:", text_color="black", font=("Arial", 16)).pack(side="left")
+        self.connection_label = ctk.CTkLabel(f, text="UP" if self.controller.node_online.get(node_id, False) else "DOWN", text_color="gray")
+        self.connection_label.pack(side="right")
+
+        f = ctk.CTkFrame(self.right, fg_color="transparent")
+        f.pack(fill="x", padx=30, pady=0)
+        self.detail_widgets.append(f)
+        self.last_seen_label = ctk.CTkLabel(f, text="", text_color="gray")
+        self.last_seen_label.pack(side="right")
+
+        f = ctk.CTkFrame(self.right, fg_color="transparent")
+        f.pack(fill="x", padx=30, pady=8)
+        self.detail_widgets.append(f)
+        ctk.CTkLabel(f, text="Door Status:", text_color="black", font=("Arial", 16)).pack(side="left")
+        self.door_status_label = ctk.CTkLabel(f, text=door_status, text_color="gray")
+        self.door_status_label.pack(side="right")
 
         divider = ctk.CTkFrame(self.right, height=1, fg_color="#cccccc")
         divider.pack(fill="x", padx=30, pady=(8, 14))
@@ -896,16 +1029,58 @@ class ESPConfigView(ctk.CTkFrame):
         self.status_lbl_ref.pack(pady=(0, 10))
         self.detail_widgets.append(self.status_lbl_ref)
 
+        btn_f = ctk.CTkFrame(self.right, fg_color="transparent")
+        btn_f.pack(pady=20)
+        self.detail_widgets.append(btn_f)
+        ctk.CTkButton(btn_f, text="Reset Calibrations", width=140, fg_color="#ff5555", text_color="white",
+                      command=self._reset_calibrations).pack(side="left", padx=10)
+
+        # Update dynamic values (connection/door status + calibration table)
+        self._update_right_panel(node_id)
+
+    def _update_right_panel(self, node_id):
+        # Update the connection/door status labels (and refresh calibration table)
+        if not node_id:
+            return
+        if self.node_number_label:
+            self.node_number_label.configure(text=node_id)
+        if self.connection_label:
+            online = self.controller.node_online.get(node_id, False)
+            self.connection_label.configure(text="UP" if online else "DOWN", text_color="#2e7d32" if online else "gray")
+
+        # Show a "last seen" timestamp only once a node has been missing for a
+        # short while (to avoid flicker during brief heartbeat gaps).
+        if self.last_seen_label:
+            last_seen = self.controller.node_last_seen.get(node_id, 0)
+            now = time.time()
+            if last_seen and (now - last_seen) > LAST_SEEN_DISPLAY_THRESHOLD:
+                age_s = int(now - last_seen)
+                if age_s < 60:
+                    ago = f"{age_s}s ago"
+                else:
+                    ago = f"{age_s//60}m ago"
+                self.last_seen_label.configure(text=f"Last seen: {ago}")
+            else:
+                self.last_seen_label.configure(text="")
+
+        if self.door_status_label:
+            node_state = self.controller.node_detected_state.get(node_id, "")
+            if node_state == "door_closed":
+                door_status = "CLOSE"
+            elif node_state == "door_open":
+                door_status = "OPEN"
+            elif node_state == "person_standing":
+                door_status = "PERSON PRESENT"
+            else:
+                door_status = "UNKNOWN"
+            self.door_status_label.configure(text=door_status)
+
+        # rebuild the calibration table so it reflects latest state changes
         self._render_calibration_table(node_id)
         try:
             self.right.update_idletasks()
         except Exception:
             pass
-
-        btn_f = ctk.CTkFrame(self.right, fg_color="transparent")
-        btn_f.pack(pady=20); self.detail_widgets.append(btn_f)
-        ctk.CTkButton(btn_f, text="Reset Calibrations", width=140, fg_color="#ff5555", text_color="white",
-                      command=self._reset_calibrations).pack(side="left", padx=10)
 
     def set_progress(self, cur, total):
         # initialize progress bar if missing
@@ -913,8 +1088,7 @@ class ESPConfigView(ctk.CTkFrame):
             self.progress_bar = ctk.CTkProgressBar(self.right, width=300)
             self.progress_bar.pack(pady=(4,10))
         self.progress_bar.set(cur/total)
-        if self.status_lbl_ref:
-            self.status_lbl_ref.configure(text=f"Status: {cur}/{total} sub-batches uploaded")
+        self._safe_configure(self.status_lbl_ref, text=f"Status: {cur}/{total} sub-batches uploaded")
 
     def _render_calibration_table(self, node_id):
         for w in self.calibration_table_widgets:
@@ -987,6 +1161,18 @@ class ESPConfigView(ctk.CTkFrame):
             pass
         return fallback
 
+    def _safe_configure(self, widget, **kwargs):
+        """Safely configure a widget that may have been destroyed.
+
+        Tkinter widgets can be destroyed while background work is still running.
+        This helper ensures we only call .configure on an existing widget.
+        """
+        try:
+            if widget is not None and getattr(widget, "winfo_exists", lambda: False)():
+                widget.configure(**kwargs)
+        except Exception:
+            pass
+
     def train_model(self, node_id):
         state_map = self.controller.esp_nodes.get(node_id, {})
         if not all(state_map.get(s, False) for s in CALIB_STATES):
@@ -1000,8 +1186,7 @@ class ESPConfigView(ctk.CTkFrame):
         if self.controller.training_in_progress.get(node_id, False):
             ts = datetime.now().strftime('%H:%M:%S')
             self.controller.all_logs.append((ts, "Model", f"Training already in progress for {node_id}"))
-            if self.status_lbl_ref:
-                self.status_lbl_ref.configure(text="Status: Training already in progress", text_color="#1a4d66")
+            self._safe_configure(self.status_lbl_ref, text="Status: Training already in progress", text_color="#1a4d66")
             return
 
         self.controller.training_in_progress[node_id] = True
@@ -1025,11 +1210,8 @@ class ESPConfigView(ctk.CTkFrame):
         ]
 
         # disable the train button to prevent re‑entry
-        if self.train_btn_ref:
-            self.train_btn_ref.configure(state="disabled")
-
-        if self.status_lbl_ref:
-            self.status_lbl_ref.configure(text=f"Status: Training model for {node_id}...", text_color="#1a4d66")
+        self._safe_configure(self.train_btn_ref, state="disabled")
+        self._safe_configure(self.status_lbl_ref, text=f"Status: Training model for {node_id}...", text_color="#1a4d66")
 
         # show a simple progress popup while training runs
         progress_popup = ctk.CTkToplevel(self)
@@ -1056,8 +1238,7 @@ class ESPConfigView(ctk.CTkFrame):
                     self.controller.all_logs.append((ts, "Model", line.strip()))
                     # also update status label with key info lines
                     if "Dataset shape" in line or "Test loss" in line:
-                        if self.status_lbl_ref:
-                            self.status_lbl_ref.configure(text=line.strip(), text_color="#1a4d66")
+                        self._safe_configure(self.status_lbl_ref, text=line.strip(), text_color="#1a4d66")
 
         # once subprocess finishes remove progress popup
         try:
@@ -1079,8 +1260,7 @@ class ESPConfigView(ctk.CTkFrame):
                     self.controller.all_logs.append((ts, "Model", line))
             ts = datetime.now().strftime('%H:%M:%S')
             self.controller.all_logs.append((ts, "Model", f"Training failed for {node_id}: {err or 'unknown error'}"))
-            if self.status_lbl_ref:
-                self.status_lbl_ref.configure(text="Status: Training failed", text_color="red")
+            self._safe_configure(self.status_lbl_ref, text="Status: Training failed", text_color="red")
             popup = ctk.CTkToplevel(self)
             popup.title("Training failed")
             popup.geometry("480x180")
@@ -1088,8 +1268,7 @@ class ESPConfigView(ctk.CTkFrame):
             ctk.CTkLabel(popup, text=err or "Check logs for details.", wraplength=440, text_color="gray").pack(pady=(0, 12))
             ctk.CTkButton(popup, text="OK", width=90, command=popup.destroy).pack()
             # re-enable button
-            if self.train_btn_ref:
-                self.train_btn_ref.configure(state="normal")
+            self._safe_configure(self.train_btn_ref, state="normal")
             self.controller.training_in_progress[node_id] = False
             return
 
@@ -1101,16 +1280,13 @@ class ESPConfigView(ctk.CTkFrame):
             self.controller.model_state[node_id] = False  # will be set true when ESP reports model_ready
             self.controller._save_model_state()
             self.controller._notify_training_complete(node_id, session)
-            if self.status_lbl_ref:
-                self.status_lbl_ref.configure(text="Status: Model trained; waiting for device to pull", text_color="#1a4d66")
+            self._safe_configure(self.status_lbl_ref, text="Status: Model trained; waiting for device to pull", text_color="#1a4d66")
         else:
             ts = datetime.now().strftime('%H:%M:%S')
             self.controller.all_logs.append((ts, "Model", f"Failed to copy model to server for {node_id}"))
-            if self.status_lbl_ref:
-                self.status_lbl_ref.configure(text="Status: Model trained but copy failed", text_color="#d32f2f")
+            self._safe_configure(self.status_lbl_ref, text="Status: Model trained but copy failed", text_color="#d32f2f")
         # re-enable train button regardless of outcome
-        if self.train_btn_ref:
-            self.train_btn_ref.configure(state="normal")
+        self._safe_configure(self.train_btn_ref, state="normal")
         self.controller.training_in_progress[node_id] = False
         if self.current_node_id == node_id:
             self._render_calibration_table(node_id)
@@ -1119,6 +1295,21 @@ class ESPConfigView(ctk.CTkFrame):
         selected_state = self.radio_var.get()
         # remember choice so UI can restore it later
         self.controller.last_calib_choice[node_id] = selected_state
+
+        # If any calibration state exists already, ask whether to replace just
+        # this state or reset all states before proceeding.
+        existing = self.controller.esp_nodes.get(node_id, {})
+        if any(existing.values()):
+            choice = self._ask_calibration_mode(node_id)
+            if choice == "cancel":
+                self._safe_configure(self.status_lbl_ref, text="Status: Calibration cancelled.", text_color="gray")
+                return
+            if choice == "reset":
+                for s in CALIB_STATES:
+                    existing[s] = False
+                self.controller._save_calib_states()
+            # if replace, only this state will be cleared below
+
         # any fresh calibration invalidates previously trained model
         self.controller._mark_model_dirty(node_id)
 
@@ -1154,27 +1345,26 @@ class ESPConfigView(ctk.CTkFrame):
         ok = self.controller._publish_collect_with_retry(node_id, selected_state, retries=3)
         if not ok:
             # publication failed locally; inform user and leave button enabled
-            if self.status_lbl_ref:
-                self.status_lbl_ref.configure(
-                    text="Status: Publish failed",
-                    text_color="red"
-                )
-                # revert to idle after a moment
-                def restore_idle():
-                    if self.status_lbl_ref:
-                        self.status_lbl_ref.configure(text="Status: Idle", text_color="gray")
-                self.after(3000, restore_idle)
+            self._safe_configure(
+                self.status_lbl_ref,
+                text="Status: Publish failed",
+                text_color="red"
+            )
+            # revert to idle after a moment
+            def restore_idle():
+                self._safe_configure(self.status_lbl_ref, text="Status: Idle", text_color="gray")
+            self.after(3000, restore_idle)
             return
 
         # disable button only after we know the message was sent successfully
         if self.start_btn_ref:
-            self.start_btn_ref.configure(state="disabled")
+            self._safe_configure(self.start_btn_ref, state="disabled")
 
-        if self.status_lbl_ref:
-            self.status_lbl_ref.configure(
-                text=f"Status: Calibrating {node_id} for {selected_state}... Please wait (~20s)",
-                text_color="#1a4d66"
-            )
+        self._safe_configure(
+            self.status_lbl_ref,
+            text=f"Status: Calibrating {node_id} for {selected_state}... Please wait (~20s)",
+            text_color="#1a4d66"
+        )
 
     def start_selected_racks(self):
         selected_nodes = [node for node, var in self.bulk_selected.items() if var.get()]
@@ -1241,10 +1431,8 @@ class ESPConfigView(ctk.CTkFrame):
                 # still on the same node, show a warning popup
                 self._show_mismatch_popup(node_id, state, expected)
                 # recover UI so user can retry
-                if self.start_btn_ref:
-                    self.start_btn_ref.configure(state="normal")
-                if self.status_lbl_ref:
-                    self.status_lbl_ref.configure(text="Status: Idle", text_color="gray")
+                self._safe_configure(self.start_btn_ref, state="normal")
+                self._safe_configure(self.status_lbl_ref, text="Status: Idle", text_color="gray")
             # clear expected values; require explicit retry from user
             self.controller.expected_calib.pop(node_id, None)
             self.controller.expected_session.pop(node_id, None)
@@ -1260,10 +1448,8 @@ class ESPConfigView(ctk.CTkFrame):
             ))
             print(f"WARNING: node {node_id} reported session '{session}' but expected '{expected_session}'")
             if self.current_node_id == node_id:
-                if self.start_btn_ref:
-                    self.start_btn_ref.configure(state="normal")
-                if self.status_lbl_ref:
-                    self.status_lbl_ref.configure(text="Status: Idle", text_color="gray")
+                self._safe_configure(self.start_btn_ref, state="normal")
+                self._safe_configure(self.status_lbl_ref, text="Status: Idle", text_color="gray")
             self.controller.expected_calib.pop(node_id, None)
             self.controller.expected_session.pop(node_id, None)
             return
@@ -1317,8 +1503,12 @@ class ESPConfigView(ctk.CTkFrame):
         all_done = all(self.controller.esp_nodes[node_id].get(s, False) for s in CALIB_STATES)
         if all_done and not self.controller.model_state.get(node_id, False) and not self.controller.training_in_progress.get(node_id, False):
             self.controller.all_logs.append((ts, "Model", f"Auto-training triggered for {node_id}"))
-            if self.current_node_id == node_id and self.status_lbl_ref:
-                self.status_lbl_ref.configure(text=f"Status: Auto-training model for {node_id}...", text_color="#1a4d66")
+            if self.current_node_id == node_id:
+                self._safe_configure(
+                    self.status_lbl_ref,
+                    text=f"Status: Auto-training model for {node_id}...",
+                    text_color="#1a4d66"
+                )
             popup = ctk.CTkToplevel(self)
             popup.title("Auto Training")
             popup.geometry("420x140")
@@ -1342,13 +1532,11 @@ class ESPConfigView(ctk.CTkFrame):
 
         # unlock next calibration on either authoritative server complete or
         # firmware fallback completion.
-        if self.start_btn_ref:
-            self.start_btn_ref.configure(state="normal")
-        if self.status_lbl_ref:
-            if server_complete:
-                self.status_lbl_ref.configure(text="Status: Idle", text_color="gray")
-            else:
-                self.status_lbl_ref.configure(text="Status: Idle (firmware fallback)", text_color="#1a4d66")
+        self._safe_configure(self.start_btn_ref, state="normal")
+        if server_complete:
+            self._safe_configure(self.status_lbl_ref, text="Status: Idle", text_color="gray")
+        else:
+            self._safe_configure(self.status_lbl_ref, text="Status: Idle (firmware fallback)", text_color="#1a4d66")
 
         self._render_calibration_table(node_id)
         # clear progress bar after completion
