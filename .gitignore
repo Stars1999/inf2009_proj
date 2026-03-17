@@ -3,3 +3,10 @@ csi_data/
 .venv/
 PRD.md
 PROGRESS.md
+calib_states.json
+model_store/_tmp/RACK_1/model.tflite
+model_store/_tmp/RACK_1/scaler_params.json
+model_store/RACK_1/model.tflite
+model_store/RACK_1/scaler_params.json
+models.json
+view_state.json
