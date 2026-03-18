@@ -9,6 +9,7 @@ import subprocess
 import sys
 import pandas as pd
 import traceback
+import tkinter as tk
 # matplotlib is only needed for ad‑hoc plotting; import lazily inside
 # the plotting helper functions so that any backend initialization happens
 # after the main Tk root is up.  This avoids sporadic segfaults on some
@@ -76,10 +77,16 @@ CALIB_FILE = "calib_states.json"           # per-node completed flags
 KEYS_FILE = "keys.json"                    # issued/in vault status
 VIEW_FILE = "view_state.json"              # last page/node
 MODEL_FILE = "models.json"                # per-node model validity flag
-ONLINE_TTL_SECONDS = 60
-# Only display 'last seen' timestamps after a short grace period to avoid
-# flickering during brief heartbeat gaps.
-LAST_SEEN_DISPLAY_THRESHOLD = 10  # seconds
+# Liveliness policy: the ESP32 publishes a lightweight heartbeat every 60s,
+# so the UI treats recent messages as online, then degrades to stale, then
+# offline if silence continues.
+HEARTBEAT_INTERVAL_SECONDS = 60
+ONLINE_TTL_SECONDS = int(HEARTBEAT_INTERVAL_SECONDS * 1.5)
+STALE_TTL_SECONDS = HEARTBEAT_INTERVAL_SECONDS * 3
+
+# Periodic presence refresh is intentionally low frequency to avoid busy UI
+# polling when nothing is changing.
+LIVENESS_TICK_SECONDS = 15
 
 
 if not os.path.exists(LOG_DIR):
@@ -111,6 +118,11 @@ class GovernanceApp(ctk.CTk):
         self.expected_calib = {}
         # remember the active collection session per node for completion matching
         self.expected_session = {}
+        # campaign/run bookkeeping so repeated calibrations stay grouped but
+        # each calibration attempt still gets its own CSI file.
+        self.collection_campaign = {}
+        self.collection_run_counter = {}
+        self.last_split_choice = {}
         # thresholds removed; model now handles inference
         # model lifecycle per-node (True if latest model is trained/valid)
         self.model_state = {node_id: False for node_id in self.esp_nodes}
@@ -148,7 +160,7 @@ class GovernanceApp(ctk.CTk):
         self.bind("<Configure>", self._on_resize)
 
         # periodic liveness check to keep connection status accurate
-        self.after(2000, self._liveness_tick)
+        self.after(LIVENESS_TICK_SECONDS * 1000, self._liveness_tick)
 
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         self.client.on_connect = self.on_connect
@@ -176,13 +188,35 @@ class GovernanceApp(ctk.CTk):
         for node_id in self.node_online:
             self.node_online[node_id] = False
 
+    def _node_presence_state(self, node_id):
+        """Return the node presence state: online, stale, or offline."""
+        last_seen = self.node_last_seen.get(node_id, 0)
+        if not last_seen:
+            return "offline"
+
+        age = time.time() - last_seen
+        if self.node_online.get(node_id, False):
+            if age <= ONLINE_TTL_SECONDS:
+                return "online"
+            if age <= STALE_TTL_SECONDS:
+                return "stale"
+        return "offline"
+
+    @staticmethod
+    def _presence_colors(state):
+        if state == "online":
+            return "#2e7d32"
+        if state == "stale":
+            return "#ff9800"
+        return "gray"
+
     def _liveness_tick(self):
         """Periodic check to expire nodes that have stopped reporting."""
         now = time.time()
         changed = False
         for node_id in list(self.node_online.keys()):
             last = self.node_last_seen.get(node_id, 0)
-            if self.node_online.get(node_id, False) and (now - last) > 15:
+            if self.node_online.get(node_id, False) and last and (now - last) > STALE_TTL_SECONDS:
                 self.node_online[node_id] = False
                 changed = True
         # Refresh the config view if status changed (e.g. connection went down)
@@ -190,19 +224,42 @@ class GovernanceApp(ctk.CTk):
             cfg = self.frames.get("MainDashboard").sub_frames.get("ESP32-C3 Configuration")
             if cfg and cfg.current_node_id:
                 cfg.refresh()
-        self.after(3000, self._liveness_tick)
+        self.after(LIVENESS_TICK_SECONDS * 1000, self._liveness_tick)
 
-    def _publish_collect_with_retry(self, node_id, label, retries=3):
+    def _publish_collect_with_retry(self, node_id, label, split_group="train", retries=3):
+        if not node_id or str(node_id) == "None" or node_id not in self.esp_nodes:
+            ts = datetime.now().strftime('%H:%M:%S')
+            self.all_logs.append((ts, "Model", f"Refused to publish collect command for invalid node id: {node_id!r}"))
+            return False
+
+        if split_group not in {"train", "dev"}:
+            split_group = "train"
+
+        campaign_id = self.collection_campaign.get(node_id)
+        if not campaign_id:
+            campaign_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            self.collection_campaign[node_id] = campaign_id
+
+        run_counter = self.collection_run_counter.get(node_id, 0) + 1
+        self.collection_run_counter[node_id] = run_counter
+
+        # each calibration attempt gets a distinct run id, while campaign_id
+        # remains stable across the whole collection session
+        run_id = f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{run_counter:02d}"
         topic = f"/commands/{node_id}/collect"
-        # generate a simple session identifier (timestamp-based)
-        session = datetime.now().strftime("%Y%m%d%H%M%S")
-        payload = json.dumps({"label": label, "session": session})
+        payload = json.dumps({
+            "label": label,
+            "session": run_id,
+            "campaign_id": campaign_id,
+            "run_id": run_id,
+            "split_group": split_group,
+        })
         for attempt in range(1, retries + 1):
             msg_info = self.client.publish(topic, payload, qos=1)
             if msg_info.rc == mqtt.MQTT_ERR_SUCCESS:
                 # only set expected values once publish actually succeeds
                 self.expected_calib[node_id] = label
-                self.expected_session[node_id] = session
+                self.expected_session[node_id] = run_id
                 return True
             time.sleep(0.2 * attempt)
         # clear stale expectations if publish failed after all retries
@@ -226,9 +283,24 @@ class GovernanceApp(ctk.CTk):
         os.makedirs(node_dir, exist_ok=True)
         model_dst = os.path.join(node_dir, "model.tflite")
         scaler_dst = os.path.join(node_dir, "scaler_params.json")
+        extra_files = [
+            "split_metadata.json",
+            "dataset_summary.json",
+        ]
+        extra_dirs = ["dataset_splits"]
         try:
             shutil.copy2(model_path, model_dst)
             shutil.copy2(scaler_path, scaler_dst)
+            src_dir = os.path.dirname(os.path.abspath(model_path))
+            for name in extra_files:
+                src_path = os.path.join(src_dir, name)
+                if os.path.exists(src_path):
+                    shutil.copy2(src_path, os.path.join(node_dir, name))
+            for dirname in extra_dirs:
+                src_path = os.path.join(src_dir, dirname)
+                dst_path = os.path.join(node_dir, dirname)
+                if os.path.isdir(src_path):
+                    shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
             return True
         except Exception as e:
             ts = datetime.now().strftime('%H:%M:%S')
@@ -427,6 +499,20 @@ class GovernanceApp(ctk.CTk):
                     self.node_online[node_id] = False
                 elif evt == "node_online":
                     self.node_online[node_id] = True
+
+                    # Accept model status updates when the node first joins.
+                    mr = payload_json.get("model_ready")
+                    if isinstance(mr, bool):
+                        if self.model_state.get(node_id) != mr:
+                            self.model_state[node_id] = mr
+                            self._save_model_state()
+                elif evt == "heartbeat":
+                    # Heartbeats can also include model_ready to keep dashboard in sync.
+                    mr = payload_json.get("model_ready")
+                    if isinstance(mr, bool):
+                        if self.model_state.get(node_id) != mr:
+                            self.model_state[node_id] = mr
+                            self._save_model_state()
                 elif evt == "collection_progress":
                     label = payload_json.get("label", "?")
                     cur = payload_json.get("sub_batch_idx", "?")
@@ -441,10 +527,22 @@ class GovernanceApp(ctk.CTk):
                             try:
                                 ci = int(cur)
                                 ti = int(total)
-                                cfg.set_progress(ci, ti)
-                                # if we've just reached the end, re-enable the start button
-                                if ci == ti and cfg.status_lbl_ref:
-                                    cfg.status_lbl_ref.configure(text="Status: Upload finished; awaiting server merge", text_color="#1a4d66")
+                                def _apply_collection_progress():
+                                    try:
+                                        if not getattr(cfg, "winfo_exists", lambda: False)():
+                                            return
+                                        cfg.set_progress(ci, ti)
+                                        # if we've just reached the end, update status text
+                                        if ci >= ti:
+                                            cfg._safe_configure(
+                                                cfg.status_lbl_ref,
+                                                text="Status: Upload finished; awaiting server merge",
+                                                text_color="#1a4d66",
+                                            )
+                                    except Exception:
+                                        pass
+
+                                self.after(0, _apply_collection_progress)
                             except Exception:
                                 pass
                 elif evt == "ack":
@@ -465,18 +563,25 @@ class GovernanceApp(ctk.CTk):
                                 try:
                                     si = int(sub)
                                     ti = int(total)
-                                    cfg.set_progress(si, ti)
-                                    # fallback unlock path: allow next calibration when
-                                    # firmware confirms all uploads were sent, even if
-                                    # server merge-complete MQTT is delayed/missing.
-                                    if si >= ti:
-                                        if cfg.start_btn_ref:
-                                            cfg.start_btn_ref.configure(state="normal")
-                                        if cfg.status_lbl_ref:
-                                            cfg.status_lbl_ref.configure(
-                                                text="Status: Upload complete (server merge pending)",
-                                                text_color="#1a4d66"
-                                            )
+                                    def _apply_upload_progress():
+                                        try:
+                                            if not getattr(cfg, "winfo_exists", lambda: False)():
+                                                return
+                                            cfg.set_progress(si, ti)
+                                            # fallback unlock path: allow next calibration when
+                                            # firmware confirms all uploads were sent, even if
+                                            # server merge-complete MQTT is delayed/missing.
+                                            if si >= ti:
+                                                cfg._safe_configure(cfg.start_btn_ref, state="normal")
+                                                cfg._safe_configure(
+                                                    cfg.status_lbl_ref,
+                                                    text="Status: Upload complete (server merge pending)",
+                                                    text_color="#1a4d66",
+                                                )
+                                        except Exception:
+                                            pass
+
+                                    self.after(0, _apply_upload_progress)
                                 except Exception:
                                     pass
                 elif evt == "state_change":
@@ -503,22 +608,44 @@ class GovernanceApp(ctk.CTk):
                     self.model_state[node_id] = True
                     self._save_model_state()
                     self.all_logs.append((ts, "Model", f"{node_id} reported model_ready"))
-                    if self.current_node_id == node_id:
-                        self._safe_configure(
-                            self.status_lbl_ref,
-                            text="Status: Model ready on device",
-                            text_color="#2e7d32"
-                        )
+
+                    cfg = None
+                    if "MainDashboard" in self.frames:
+                        subs = self.frames["MainDashboard"].sub_frames
+                        cfg = subs.get("ESP32-C3 Configuration")
+                    if cfg and cfg.current_node_id == node_id:
+                        def _show_model_ready():
+                            try:
+                                cfg._safe_configure(
+                                    cfg.status_lbl_ref,
+                                    text="Status: Model ready on device",
+                                    text_color="#2e7d32",
+                                )
+                            except Exception:
+                                pass
+
+                        self.after(0, _show_model_ready)
                 elif evt == "model_download_failed":
                     self.model_state[node_id] = False
                     self._save_model_state()
                     self.all_logs.append((ts, "Model", f"{node_id} model download failed"))
-                    if self.current_node_id == node_id:
-                        self._safe_configure(
-                            self.status_lbl_ref,
-                            text="Status: Model download failed (check ESP logs)",
-                            text_color="red"
-                        )
+
+                    cfg = None
+                    if "MainDashboard" in self.frames:
+                        subs = self.frames["MainDashboard"].sub_frames
+                        cfg = subs.get("ESP32-C3 Configuration")
+                    if cfg and cfg.current_node_id == node_id:
+                        def _show_model_failed():
+                            try:
+                                cfg._safe_configure(
+                                    cfg.status_lbl_ref,
+                                    text="Status: Model download failed (check ESP logs)",
+                                    text_color="red",
+                                )
+                            except Exception:
+                                pass
+
+                        self.after(0, _show_model_failed)
             except json.JSONDecodeError:
                 pass
         
@@ -685,18 +812,16 @@ class HomeView(ctk.CTkFrame):
         total_keys = len(self.controller.keys)
         issued_keys = sum(1 for status in self.controller.keys.values() if status == "out")
         vault_keys = sum(1 for status in self.controller.keys.values() if status == "in")
-        # estimate online nodes: seen within last ONLINE_TTL_SECONDS
-        now = time.time()
         online = 0
+        stale = 0
         for node_id in self.controller.esp_nodes:
-            seen = self.controller.node_last_seen.get(node_id, 0)
-            is_recent = (now - seen) < ONLINE_TTL_SECONDS
-            if self.controller.node_online.get(node_id, False) and is_recent:
+            presence = self.controller._node_presence_state(node_id)
+            if presence == "online":
                 online += 1
-            elif not is_recent:
-                self.controller.node_online[node_id] = False
+            elif presence == "stale":
+                stale += 1
         total_nodes = len(self.controller.esp_nodes)
-        offline = total_nodes - online
+        offline = total_nodes - online - stale
         # Define stats list with calculated values
         stats = [
             (str(total_keys), "Total Keys"), 
@@ -704,6 +829,7 @@ class HomeView(ctk.CTkFrame):
             (str(vault_keys), "Key In Vault"),
             (str(total_nodes), "Total ESP32-C3"), 
             (str(online), "ESP32-C3 Online"), 
+            (str(stale), "ESP32-C3 Stale"),
             (str(offline), "ESP32-C3 Offline")
         ]
 
@@ -771,6 +897,7 @@ class ESPConfigView(ctk.CTkFrame):
         self.node_state_labels = {}
         self.node_buttons = {}
         self.bulk_label_var = ctk.StringVar(value="door_closed")
+        self.bulk_split_var = ctk.StringVar(value="train")
 
         # 4 Nodes total for now
         for i in range(1, 5):
@@ -800,6 +927,8 @@ class ESPConfigView(ctk.CTkFrame):
         ctk.CTkLabel(bulk_box, text="Bulk Label", font=("Arial", 13, "bold")).pack(anchor="w", pady=(6, 4))
         for state in CALIB_STATES:
             ctk.CTkRadioButton(bulk_box, text=state, variable=self.bulk_label_var, value=state).pack(anchor="w")
+        ctk.CTkLabel(bulk_box, text="Bulk Split", font=("Arial", 13, "bold")).pack(anchor="w", pady=(8, 4))
+        ctk.CTkOptionMenu(bulk_box, values=["train", "dev"], variable=self.bulk_split_var, width=120).pack(anchor="w")
         ctk.CTkButton(
             bulk_box,
             text="Start Selected Racks",
@@ -823,7 +952,9 @@ class ESPConfigView(ctk.CTkFrame):
         self.start_btn_ref = None
         self.status_lbl_ref = None
         self.train_btn_ref = None
+        self.summary_btn_ref = None
         self.model_status_lbl_ref = None
+        self.split_var = ctk.StringVar(value="train")
         # placeholder label lives inside scrollable frame
         self.placeholder = ctk.CTkLabel(self.right, text="Select a node to view details", text_color="gray")
         # use pack instead of place so it scrolls naturally
@@ -867,16 +998,20 @@ class ESPConfigView(ctk.CTkFrame):
         self.wait_window(popup)
         return result["ok"]
 
-    def _ask_calibration_mode(self, node_id: str) -> str:
-        """Ask user whether to replace one state or reset all calibration states."""
+    def _ask_calibration_mode(self, node_id: str, state: str, split_group: str) -> str:
+        """Ask user whether to append, replace, or reset calibration data."""
         popup = ctk.CTkToplevel(self)
         popup.title("Calibration conflict")
-        popup.geometry("480x200")
+        popup.geometry("520x220")
         popup.transient(self)
         popup.lift()
         popup.focus_force()
 
         result = {"choice": "cancel"}
+
+        def _append():
+            result["choice"] = "append"
+            popup.destroy()
 
         def _replace():
             result["choice"] = "replace"
@@ -894,16 +1029,17 @@ class ESPConfigView(ctk.CTkFrame):
         ctk.CTkLabel(
             popup,
             text=(
-                f"Node {node_id} already has some calibrations stored.\n"
-                "Choose whether to replace the current state or reset all states.\n"
-                "(Resetting clears all three states and starts fresh.)"
+                f"Node {node_id} already has calibration data for '{state}' (split: {split_group}).\n"
+                "You can append another session, replace the existing data for this state,\n"
+                "or reset all states and start fresh."
             ),
-            wraplength=440,
+            wraplength=480,
             justify="left"
         ).pack(pady=(16, 10), padx=20)
 
         btn_frame = ctk.CTkFrame(popup, fg_color="transparent")
         btn_frame.pack(pady=(0, 16))
+        ctk.CTkButton(btn_frame, text="Append session", width=160, command=_append).pack(side="left", padx=8)
         ctk.CTkButton(btn_frame, text="Replace state", width=140, command=_replace).pack(side="left", padx=8)
         ctk.CTkButton(btn_frame, text="Reset all", width=120, command=_reset).pack(side="left", padx=8)
         ctk.CTkButton(btn_frame, text="Cancel", width=100, command=_cancel).pack(side="left", padx=8)
@@ -913,34 +1049,28 @@ class ESPConfigView(ctk.CTkFrame):
         return result["choice"]
 
     def _refresh_node_status_list(self):
-        now = time.time()
         any_key_out = any(v == "out" for v in self.controller.keys.values())
         for node_id, dot in self.node_status_labels.items():
-            seen = self.controller.node_last_seen.get(node_id, 0)
-            online = self.controller.node_online.get(node_id, False) and ((now - seen) < ONLINE_TTL_SECONDS)
+            presence = self.controller._node_presence_state(node_id)
             state = self.controller.node_detected_state.get(node_id)
             state_lbl = self.node_state_labels.get(node_id)
+            dot.configure(text_color=self.controller._presence_colors(presence))
             if state == "door_closed":
-                dot.configure(text_color="#2e7d32")
                 if state_lbl:
                     state_lbl.configure(text="door_closed", text_color="#2e7d32")
             elif state == "door_open":
                 if any_key_out:
-                    dot.configure(text_color="#ff9800")
                     if state_lbl:
                         state_lbl.configure(text="door_open (authorized)", text_color="#ff9800")
                 else:
-                    dot.configure(text_color="#d32f2f")
                     if state_lbl:
                         state_lbl.configure(text="door_open (unauthorized)", text_color="#d32f2f")
             elif state == "person_standing":
-                dot.configure(text_color="#ff9800")
                 if state_lbl:
                     state_lbl.configure(text="person_standing", text_color="#ff9800")
             else:
-                dot.configure(text_color="#2e7d32" if online else "gray")
                 if state_lbl:
-                    state_lbl.configure(text="online" if online else "offline", text_color="#2e7d32" if online else "gray")
+                    state_lbl.configure(text=presence, text_color=self.controller._presence_colors(presence))
 
     def show_details(self, node_id):
         self.current_node_id = node_id
@@ -948,13 +1078,22 @@ class ESPConfigView(ctk.CTkFrame):
         self.controller.last_node = node_id
         self.controller._save_view_state()
         self.placeholder.pack_forget()
-        for w in self.detail_widgets: w.destroy()
+        for w in list(self.detail_widgets):
+            try:
+                w.destroy()
+            except tk.TclError:
+                # Some CTk widgets (e.g., OptionMenu) can raise on destroy if their
+                # underlying Tk trace callback has already been removed.
+                # This is non-fatal; ignore and continue cleaning up remaining widgets.
+                pass
         self.detail_widgets = []
         self.calibration_table_widgets = []
         self.start_btn_ref = None
         self.status_lbl_ref = None
         self.train_btn_ref = None
+        self.summary_btn_ref = None
         self.model_status_lbl_ref = None
+        self.split_var = ctk.StringVar(value=self.controller.last_split_choice.get(node_id, "train"))
         # restore last radio choice for this node if available
         default_choice = self.controller.last_calib_choice.get(node_id, "door_closed")
         self.radio_var = ctk.StringVar(value=default_choice)
@@ -987,7 +1126,8 @@ class ESPConfigView(ctk.CTkFrame):
         f.pack(fill="x", padx=30, pady=8)
         self.detail_widgets.append(f)
         ctk.CTkLabel(f, text="Connection:", text_color="black", font=("Arial", 16)).pack(side="left")
-        self.connection_label = ctk.CTkLabel(f, text="UP" if self.controller.node_online.get(node_id, False) else "DOWN", text_color="gray")
+        presence = self.controller._node_presence_state(node_id)
+        self.connection_label = ctk.CTkLabel(f, text=presence.upper(), text_color=self.controller._presence_colors(presence))
         self.connection_label.pack(side="right")
 
         f = ctk.CTkFrame(self.right, fg_color="transparent")
@@ -1016,6 +1156,28 @@ class ESPConfigView(ctk.CTkFrame):
             rb = ctk.CTkRadioButton(radio_group, text=state, variable=self.radio_var, value=state)
             rb.pack(anchor="w", pady=2)
 
+        ctk.CTkLabel(radio_group, text="Collection Split:", text_color="black", font=("Arial", 16)).pack(anchor="w", pady=(8, 0))
+        split_menu = ctk.CTkOptionMenu(
+            radio_group,
+            values=["train", "dev", "test"],
+            variable=self.split_var,
+            command=lambda v, n=node_id: self.controller.last_split_choice.__setitem__(n, v),
+            width=140,
+        )
+        split_menu.pack(anchor="w", pady=(2, 4))
+        self.detail_widgets.append(split_menu)
+
+        # By default we append new collection sessions (no interruption), but
+        # allow the user to explicitly request an overwrite/replace prompt.
+        self.ask_overwrite_var = tk.BooleanVar(value=False)
+        self.ask_overwrite_checkbox = ctk.CTkCheckBox(
+            radio_group,
+            text="Prompt before overwriting existing split data",
+            variable=self.ask_overwrite_var,
+        )
+        self.ask_overwrite_checkbox.pack(anchor="w", pady=(0, 8))
+        self.detail_widgets.append(self.ask_overwrite_checkbox)
+
         self.start_btn_ref = ctk.CTkButton(
             self.right,
             text="Start Calibration",
@@ -1029,6 +1191,15 @@ class ESPConfigView(ctk.CTkFrame):
         self.status_lbl_ref.pack(pady=(0, 10))
         self.detail_widgets.append(self.status_lbl_ref)
 
+        self.summary_btn_ref = ctk.CTkButton(
+            self.right,
+            text="Dataset Summary",
+            fg_color="#666666",
+            command=lambda n=node_id: self.show_dataset_summary(n)
+        )
+        self.summary_btn_ref.pack(pady=(0, 8))
+        self.detail_widgets.append(self.summary_btn_ref)
+
         btn_f = ctk.CTkFrame(self.right, fg_color="transparent")
         btn_f.pack(pady=20)
         self.detail_widgets.append(btn_f)
@@ -1037,31 +1208,37 @@ class ESPConfigView(ctk.CTkFrame):
 
         # Update dynamic values (connection/door status + calibration table)
         self._update_right_panel(node_id)
+        self._scroll_details_to_top()
 
     def _update_right_panel(self, node_id):
         # Update the connection/door status labels (and refresh calibration table)
         if not node_id:
             return
         if self.node_number_label:
-            self.node_number_label.configure(text=node_id)
+            self._safe_configure(self.node_number_label, text=node_id)
         if self.connection_label:
-            online = self.controller.node_online.get(node_id, False)
-            self.connection_label.configure(text="UP" if online else "DOWN", text_color="#2e7d32" if online else "gray")
+            presence = self.controller._node_presence_state(node_id)
+            self._safe_configure(
+                self.connection_label,
+                text=presence.upper(),
+                text_color=self.controller._presence_colors(presence),
+            )
 
         # Show a "last seen" timestamp only once a node has been missing for a
         # short while (to avoid flicker during brief heartbeat gaps).
         if self.last_seen_label:
             last_seen = self.controller.node_last_seen.get(node_id, 0)
+            presence = self.controller._node_presence_state(node_id)
             now = time.time()
-            if last_seen and (now - last_seen) > LAST_SEEN_DISPLAY_THRESHOLD:
+            if last_seen and presence != "online":
                 age_s = int(now - last_seen)
                 if age_s < 60:
                     ago = f"{age_s}s ago"
                 else:
                     ago = f"{age_s//60}m ago"
-                self.last_seen_label.configure(text=f"Last seen: {ago}")
+                self._safe_configure(self.last_seen_label, text=f"Last seen: {ago}")
             else:
-                self.last_seen_label.configure(text="")
+                self._safe_configure(self.last_seen_label, text="")
 
         if self.door_status_label:
             node_state = self.controller.node_detected_state.get(node_id, "")
@@ -1073,10 +1250,270 @@ class ESPConfigView(ctk.CTkFrame):
                 door_status = "PERSON PRESENT"
             else:
                 door_status = "UNKNOWN"
-            self.door_status_label.configure(text=door_status)
+            self._safe_configure(self.door_status_label, text=door_status)
 
         # rebuild the calibration table so it reflects latest state changes
         self._render_calibration_table(node_id)
+
+    def _latest_dataset_summary_path(self, node_id):
+        candidates = [
+            os.path.join(MODEL_STORE_DIR, node_id, "dataset_summary.json"),
+            os.path.join(MODEL_STORE_DIR, "_tmp", node_id, "dataset_summary.json"),
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        return None
+
+    def _current_campaign_id(self, node_id):
+        campaign = self.controller.collection_campaign.get(node_id)
+        if isinstance(campaign, str) and campaign.strip():
+            return campaign.strip()
+
+        data_base = self._resolve_data_base()
+        node_dir = os.path.join(str(data_base), str(node_id))
+        if not os.path.isdir(node_dir):
+            return None
+
+        latest = None
+        for path in glob.glob(os.path.join(node_dir, "**", "*_manifest.json"), recursive=True):
+            try:
+                with open(path, "r", encoding="utf-8") as fp:
+                    manifest = json.load(fp)
+                campaign_id = manifest.get("campaign_id")
+                if not isinstance(campaign_id, str) or not campaign_id.strip():
+                    continue
+                mtime = os.path.getmtime(path)
+                if latest is None or mtime > latest[0]:
+                    latest = (mtime, campaign_id.strip())
+            except Exception:
+                continue
+
+        return latest[1] if latest else None
+
+    def _build_live_dataset_summary(self, node_id):
+        data_base = self._resolve_data_base()
+        node_dir = os.path.join(str(data_base), str(node_id))
+        if not os.path.isdir(node_dir):
+            return None
+
+        summary = {
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "node_id": node_id,
+            "source": "live_scan",
+            "campaign_id": self._current_campaign_id(node_id),
+            "labels": {},
+            "splits": {},
+        }
+
+        active_campaign = summary["campaign_id"]
+        manifest_paths = [
+            path for path in glob.glob(os.path.join(node_dir, "**", "*_manifest.json"), recursive=True)
+            if os.path.isfile(path) and os.path.basename(path) != "session_manifest.json"
+        ]
+
+        has_campaign_data = False
+        for state in CALIB_STATES:
+            summary["labels"][state] = {
+                "files": 0,
+                "sessions": 0,
+                "rows_raw": 0,
+                "rows_clean": 0,
+                "split_files": {"train": 0, "dev": 0, "test": 0},
+                "split_rows": {"train": 0, "dev": 0, "test": 0},
+            }
+
+        if active_campaign and manifest_paths:
+            for path in manifest_paths:
+                try:
+                    with open(path, "r", encoding="utf-8") as fp:
+                        manifest = json.load(fp)
+                except Exception:
+                    continue
+
+                if manifest.get("campaign_id") != active_campaign:
+                    continue
+                label = manifest.get("label")
+                if label not in summary["labels"]:
+                    continue
+
+                row_count = int(manifest.get("row_count", 0) or 0)
+                split_group = manifest.get("split_group", "train")
+                if split_group not in {"train", "dev", "test"}:
+                    split_group = "train"
+
+                label_summary = summary["labels"][label]
+                label_summary["files"] += 1
+                label_summary["sessions"] += 1
+                label_summary["rows_raw"] += row_count
+                label_summary["rows_clean"] += row_count
+                label_summary["split_files"][split_group] += 1
+                label_summary["split_rows"][split_group] += row_count
+                has_campaign_data = True
+
+        if not has_campaign_data:
+            for state in CALIB_STATES:
+                state_dir = os.path.join(node_dir, state)
+                csv_paths = [
+                    path for path in glob.glob(os.path.join(state_dir, "**", "*.csv"), recursive=True)
+                    if os.path.isfile(path) and not os.path.basename(path).startswith("part_")
+                ]
+                total_rows = 0
+                split_files = {"train": 0, "dev": 0, "test": 0}
+                split_rows = {"train": 0, "dev": 0, "test": 0}
+                sessions = set()
+                for path in csv_paths:
+                    sessions.add(os.path.splitext(os.path.basename(path))[0])
+                    try:
+                        df = pd.read_csv(path)
+                        total_rows += int(len(df))
+                        split_col = None
+                        detected_split = ""
+                        for candidate in ("collection_split", "split_group", "dataset_split"):
+                            if candidate in df.columns:
+                                split_col = candidate
+                                break
+                        if split_col:
+                            split_series = df[split_col].astype(str).str.lower()
+                            split_series = split_series[split_series.isin(("train", "dev", "test"))]
+                            if not split_series.empty:
+                                detected_split = str(split_series.mode().iloc[0])
+                            counts = split_series.value_counts().to_dict()
+                            for split_name in split_rows:
+                                split_rows[split_name] += int(counts.get(split_name, 0))
+                        else:
+                            split_rows["train"] += int(len(df))
+
+                        if not detected_split:
+                            base_name = os.path.basename(path).lower()
+                            for split_name in ("train", "dev", "test"):
+                                if f"_{split_name}_" in base_name:
+                                    detected_split = split_name
+                                    break
+                        if detected_split not in ("train", "dev", "test"):
+                            detected_split = "train"
+                        split_files[detected_split] += 1
+                    except Exception:
+                        pass
+                summary["labels"][state] = {
+                    "files": int(len(csv_paths)),
+                    "sessions": int(len(sessions)),
+                    "rows_raw": int(total_rows),
+                    "rows_clean": int(total_rows),
+                    "split_files": split_files,
+                    "split_rows": split_rows,
+                }
+
+        for split_name in ("train", "dev", "test"):
+            summary["splits"][split_name] = {
+                "rows": int(sum(info.get("split_rows", {}).get(split_name, 0) for info in summary["labels"].values())),
+            }
+
+        return summary
+
+    def show_dataset_summary(self, node_id):
+        summary = None
+        summary_path = self._latest_dataset_summary_path(node_id)
+        if summary_path:
+            try:
+                with open(summary_path, "r", encoding="utf-8") as fp:
+                    summary = json.load(fp)
+            except Exception as e:
+                ts = datetime.now().strftime('%H:%M:%S')
+                self.controller.all_logs.append((ts, "Model", f"Failed to read dataset summary for {node_id}: {e}"))
+
+        if summary is None:
+            summary = self._build_live_dataset_summary(node_id)
+
+        popup = ctk.CTkToplevel(self)
+        popup.title(f"Dataset Summary - {node_id}")
+        popup.geometry("760x540")
+        popup.transient(self)
+        popup.lift()
+
+        box = ctk.CTkTextbox(popup, wrap="word")
+        box.pack(fill="both", expand=True, padx=12, pady=12)
+
+        if not summary:
+            box.insert("end", "No dataset summary is available yet.\n\n")
+            box.insert("end", "Collect at least one session per label and run training once to generate the curated split summary.\n")
+            box.configure(state="disabled")
+            return
+
+        lines = [f"Node: {node_id}", f"Generated: {summary.get('generated_at', 'unknown')}"]
+        if summary.get("source"):
+            lines.append(f"Source: {summary['source']}")
+        overall = summary.get("overall", {})
+        if overall:
+            lines.append("")
+            lines.append("Overall")
+            lines.append(f"  Raw rows: {overall.get('rows_raw', 'n/a')}")
+            lines.append(f"  Clean rows: {overall.get('rows_clean', 'n/a')}")
+            lines.append(f"  Redundant rows: {overall.get('redundant_rows', 'n/a')}")
+            lines.append(f"  Redundancy rate: {overall.get('redundancy_rate', 'n/a')}")
+
+        labels = summary.get("labels", {})
+        if labels:
+            lines.append("")
+            lines.append("Per-label coverage")
+            for state in CALIB_STATES:
+                info = labels.get(state, {})
+                lines.append(
+                    f"  {state}: raw_rows={info.get('rows_raw', info.get('files', 'n/a'))}, "
+                    f"clean_rows={info.get('rows_clean', 'n/a')}, sessions={info.get('sessions_raw', info.get('sessions', 'n/a'))}, "
+                    f"redundant={info.get('redundant_rows', 'n/a')}"
+                )
+                split_rows = info.get("split_rows", {})
+                if split_rows:
+                    # Only show the test split if it actually has data
+                    if split_rows.get('test', 0):
+                        lines.append(
+                            f"    split rows -> train={split_rows.get('train', 0)}, dev={split_rows.get('dev', 0)}, test={split_rows.get('test', 0)}"
+                        )
+                    else:
+                        lines.append(
+                            f"    split rows -> train={split_rows.get('train', 0)}, dev={split_rows.get('dev', 0)}"
+                        )
+
+        splits = summary.get("splits", {})
+        if splits:
+            lines.append("")
+            lines.append("Split coverage")
+            for split_name in ("train", "dev", "test"):
+                split_info = splits.get(split_name, {})
+                rows = split_info.get('rows', 0)
+                if split_name == "test" and not rows:
+                    continue
+                lines.append(
+                    f"  {split_name}: rows={split_info.get('rows', 'n/a')}, sessions={split_info.get('sessions', 'n/a')}"
+                )
+                per_label = split_info.get("per_label", {})
+                for state in CALIB_STATES:
+                    state_info = per_label.get(state, {})
+                    lines.append(
+                        f"    - {state}: rows={state_info.get('rows', 'n/a')}, sessions={state_info.get('sessions', 'n/a')}"
+                    )
+
+        session_splits = summary.get("session_splits", {})
+        if session_splits:
+            lines.append("")
+            lines.append("Session split allocation")
+            for state in CALIB_STATES:
+                state_info = session_splits.get(state, {})
+                train_count = state_info.get('train_count', 'n/a')
+                dev_count = state_info.get('dev_count', 'n/a')
+                test_count = state_info.get('test_count', 0)
+                if test_count:
+                    lines.append(
+                        f"  {state}: train={train_count}, dev={dev_count}, test={test_count}"
+                    )
+                else:
+                    lines.append(
+                        f"  {state}: train={train_count}, dev={dev_count}"
+                    )
+
+        box.insert("end", "\n".join(str(line) for line in lines))
+        box.configure(state="disabled")
         try:
             self.right.update_idletasks()
         except Exception:
@@ -1104,6 +1541,20 @@ class ESPConfigView(ctk.CTkFrame):
 
         # ensure the map exists (in case we added a node later)
         state_map = self.controller.esp_nodes.setdefault(node_id, {s: False for s in CALIB_STATES})
+        live_summary = self._build_live_dataset_summary(node_id) or {}
+        current_campaign = live_summary.get("campaign_id", "")
+
+        if current_campaign:
+            campaign_row = ctk.CTkLabel(
+                self.right,
+                text=f"Current session: {current_campaign}",
+                text_color="#666666",
+                font=("Arial", 12, "italic"),
+            )
+            campaign_row.pack(anchor="w", padx=30, pady=(0, 8))
+            self.calibration_table_widgets.append(campaign_row)
+            self.detail_widgets.append(campaign_row)
+
         for state in CALIB_STATES:
             row = ctk.CTkFrame(self.right, fg_color="transparent")
             row.pack(fill="x", padx=30, pady=2)
@@ -1111,6 +1562,18 @@ class ESPConfigView(ctk.CTkFrame):
             self.detail_widgets.append(row)
 
             ctk.CTkLabel(row, text=state, text_color="black", font=("Arial", 14)).pack(side="left")
+            info = live_summary.get("labels", {}).get(state, {})
+            row_count = int(info.get("rows_raw", 0) or 0)
+            file_count = int(info.get("files", 0) or 0)
+            split_files = info.get("split_files", {}) if isinstance(info, dict) else {}
+            train_files = int(split_files.get("train", 0) or 0)
+            dev_files = int(split_files.get("dev", 0) or 0)
+            test_files = int(split_files.get("test", 0) or 0)
+            count_text = (
+                f"{file_count} file{'s' if file_count != 1 else ''}, {row_count} row{'s' if row_count != 1 else ''} "
+                f"| train: {train_files}, dev: {dev_files}, test: {test_files}"
+            )
+            ctk.CTkLabel(row, text=count_text, text_color="#666666", font=("Arial", 12)).pack(side="right", padx=(8, 0))
             done = state_map.get(state, False)
             status_text = "✓ Done" if done else "○ Pending"
             status_color = "#2e7d32" if done else "gray"
@@ -1135,6 +1598,23 @@ class ESPConfigView(ctk.CTkFrame):
             self.train_btn_ref.pack(anchor="w", padx=30, pady=(2, 10))
             self.calibration_table_widgets.append(self.train_btn_ref)
             self.detail_widgets.append(self.train_btn_ref)
+
+    def _auto_training_splits_ready(self, node_id):
+        """Return True when train and dev both have at least one file per label.
+
+        Auto-training should only begin once the current node has completed all
+        calibration states and both training splits are populated. Test is still
+        optional for the workflow in this project.
+        """
+        summary = self._build_live_dataset_summary(node_id) or {}
+        labels = summary.get("labels", {})
+        for split_name in ("train", "dev"):
+            for state in CALIB_STATES:
+                info = labels.get(state, {})
+                split_files = info.get("split_files", {}) if isinstance(info, dict) else {}
+                if int(split_files.get(split_name, 0) or 0) <= 0:
+                    return False
+        return True
 
     def _resolve_data_base(self):
         configured = getattr(self.controller, "csi_data_dir", None)
@@ -1172,6 +1652,24 @@ class ESPConfigView(ctk.CTkFrame):
                 widget.configure(**kwargs)
         except Exception:
             pass
+
+    def _scroll_details_to_top(self):
+        """Best-effort reset of the right-side scrollable frame to the top."""
+        try:
+            if hasattr(self.right, "yview_moveto"):
+                self.right.yview_moveto(0)
+                return
+        except Exception:
+            pass
+
+        for attr_name in ("_parent_canvas", "canvas", "_canvas"):
+            try:
+                canvas = getattr(self.right, attr_name, None)
+                if canvas is not None and hasattr(canvas, "yview_moveto"):
+                    canvas.yview_moveto(0)
+                    return
+            except Exception:
+                pass
 
     def train_model(self, node_id):
         state_map = self.controller.esp_nodes.get(node_id, {})
@@ -1292,28 +1790,65 @@ class ESPConfigView(ctk.CTkFrame):
             self._render_calibration_table(node_id)
 
     def start_calibration(self, node_id):
+        if not node_id or node_id not in self.controller.esp_nodes:
+            popup = ctk.CTkToplevel(self)
+            popup.title("Calibration error")
+            popup.geometry("360x140")
+            ctk.CTkLabel(popup, text="Select a valid rack before starting calibration.", wraplength=320).pack(pady=20)
+            ctk.CTkButton(popup, text="OK", width=90, command=popup.destroy).pack()
+            return
+
         selected_state = self.radio_var.get()
+        selected_split = self.split_var.get()
+        if selected_split not in {"train", "dev", "test"}:
+            selected_split = "train"
+        self.controller.last_split_choice[node_id] = selected_split
         # remember choice so UI can restore it later
         self.controller.last_calib_choice[node_id] = selected_state
 
-        # If any calibration state exists already, ask whether to replace just
-        # this state or reset all states before proceeding.
+        # Determine if we already have collected any data for this node/state/split
+        data_base = self._resolve_data_base()
+        has_split_files = False
+        if isinstance(data_base, (str, os.PathLike)) and data_base:
+            state_dir = os.path.join(str(data_base), str(node_id), str(selected_state))
+            if os.path.isdir(state_dir):
+                pattern = f"csi_{selected_state}_{selected_split}_*.csv"
+                has_split_files = bool(glob.glob(os.path.join(state_dir, pattern)))
+
+        # Append mode is the default (no prompt).  Prompt only if the user explicitly
+        # enables it via the checkbox and we have existing data for the selected split.
         existing = self.controller.esp_nodes.get(node_id, {})
-        if any(existing.values()):
-            choice = self._ask_calibration_mode(node_id)
+        prompt_conflict = has_split_files and self.ask_overwrite_var.get()
+        if prompt_conflict:
+            choice = self._ask_calibration_mode(node_id, selected_state, selected_split)
             if choice == "cancel":
                 self._safe_configure(self.status_lbl_ref, text="Status: Calibration cancelled.", text_color="gray")
                 return
             if choice == "reset":
-                for s in CALIB_STATES:
-                    existing[s] = False
-                self.controller._save_calib_states()
-            # if replace, only this state will be cleared below
+                # Reset all states and clear stored CSI data (same behavior as the Reset button)
+                self._reset_calibrations()
+            elif choice == "replace":
+                # Remove only the existing files for the selected split so we can start fresh.
+                if isinstance(data_base, (str, os.PathLike)) and data_base:
+                    state_dir = os.path.join(str(data_base), str(node_id), str(selected_state))
+                    if os.path.isdir(state_dir):
+                        for f in glob.glob(os.path.join(state_dir, f"csi_{selected_state}_{selected_split}_*.csv")):
+                            try:
+                                os.remove(f)
+                            except Exception:
+                                pass
+                        # If no data remains for this state at all, clear the completed flag.
+                        remaining = bool(glob.glob(os.path.join(state_dir, f"csi_{selected_state}_*.csv")))
+                        if not remaining:
+                            existing[selected_state] = False
+                            self.controller._save_calib_states()
+            # append is a no-op: keep old data and add another session
 
         # any fresh calibration invalidates previously trained model
         self.controller._mark_model_dirty(node_id)
 
-        # ensure a fresh dataset for each new calibration cycle
+        # keep prior CSI sessions so each label can accumulate multiple runs;
+        # only the calibration flags change here.
         data_base = self._resolve_data_base()
         if not isinstance(data_base, (str, os.PathLike)) or not data_base:
             ts = datetime.now().strftime('%H:%M:%S')
@@ -1328,13 +1863,8 @@ class ESPConfigView(ctk.CTkFrame):
 
         state_dir = os.path.join(str(data_base), str(node_id), str(selected_state))
         if os.path.isdir(state_dir):
-            try:
-                shutil.rmtree(state_dir)
-                ts = datetime.now().strftime('%H:%M:%S')
-                self.controller.all_logs.append((ts, "Model", f"Cleared old CSI data for {node_id}/{selected_state}"))
-            except Exception as e:
-                ts = datetime.now().strftime('%H:%M:%S')
-                self.controller.all_logs.append((ts, "Model", f"Failed to clear CSI data for {node_id}/{selected_state}: {e}"))
+            ts = datetime.now().strftime('%H:%M:%S')
+            self.controller.all_logs.append((ts, "Model", f"Appending new CSI session under {node_id}/{selected_state}"))
 
         # reset progress UI
         try:
@@ -1342,7 +1872,7 @@ class ESPConfigView(ctk.CTkFrame):
         except Exception:
             pass
         # attempt to publish command with retries
-        ok = self.controller._publish_collect_with_retry(node_id, selected_state, retries=3)
+        ok = self.controller._publish_collect_with_retry(node_id, selected_state, split_group=selected_split, retries=3)
         if not ok:
             # publication failed locally; inform user and leave button enabled
             self._safe_configure(
@@ -1362,7 +1892,7 @@ class ESPConfigView(ctk.CTkFrame):
 
         self._safe_configure(
             self.status_lbl_ref,
-            text=f"Status: Calibrating {node_id} for {selected_state}... Please wait (~20s)",
+            text=f"Status: Calibrating {node_id} for {selected_state} [{selected_split}]... Please wait (~20s)",
             text_color="#1a4d66"
         )
 
@@ -1377,24 +1907,23 @@ class ESPConfigView(ctk.CTkFrame):
             return
 
         selected_state = self.bulk_label_var.get()
+        selected_split = self.bulk_split_var.get()
+        if selected_split not in {"train", "dev", "test"}:
+            selected_split = "train"
         success_count = 0
         failed_nodes = []
         for node_id in selected_nodes:
             self.controller.last_calib_choice[node_id] = selected_state
+            self.controller.last_split_choice[node_id] = selected_split
             self.controller._mark_model_dirty(node_id)
 
             data_base = self._resolve_data_base()
             state_dir = os.path.join(data_base, node_id, selected_state)
             if os.path.isdir(state_dir):
-                try:
-                    shutil.rmtree(state_dir)
-                    ts = datetime.now().strftime('%H:%M:%S')
-                    self.controller.all_logs.append((ts, "Model", f"Cleared old CSI data for {node_id}/{selected_state}"))
-                except Exception as e:
-                    ts = datetime.now().strftime('%H:%M:%S')
-                    self.controller.all_logs.append((ts, "Model", f"Failed to clear CSI data for {node_id}/{selected_state}: {e}"))
+                ts = datetime.now().strftime('%H:%M:%S')
+                self.controller.all_logs.append((ts, "Bulk", f"Appending new CSI session under {node_id}/{selected_state}"))
 
-            if self.controller._publish_collect_with_retry(node_id, selected_state, retries=3):
+            if self.controller._publish_collect_with_retry(node_id, selected_state, split_group=selected_split, retries=3):
                 success_count += 1
             else:
                 failed_nodes.append(node_id)
@@ -1404,15 +1933,15 @@ class ESPConfigView(ctk.CTkFrame):
             self.controller.all_logs.append((
                 ts,
                 "Bulk",
-                f"Started {selected_state} for {success_count}/{len(selected_nodes)} racks; failed: {', '.join(failed_nodes)}"
+                f"Started {selected_state} [{selected_split}] for {success_count}/{len(selected_nodes)} racks; failed: {', '.join(failed_nodes)}"
             ))
         else:
-            self.controller.all_logs.append((ts, "Bulk", f"Started {selected_state} for {success_count}/{len(selected_nodes)} racks"))
+            self.controller.all_logs.append((ts, "Bulk", f"Started {selected_state} [{selected_split}] for {success_count}/{len(selected_nodes)} racks"))
 
         popup = ctk.CTkToplevel(self)
         popup.title("Bulk calibration")
         popup.geometry("420x170")
-        msg = f"Started {selected_state} on {success_count}/{len(selected_nodes)} selected racks."
+        msg = f"Started {selected_state} [{selected_split}] on {success_count}/{len(selected_nodes)} selected racks."
         if failed_nodes:
             msg += f"\nFailed: {', '.join(failed_nodes)}"
         ctk.CTkLabel(popup, text=msg, font=("Arial", 13), justify="left").pack(pady=24)
@@ -1501,7 +2030,8 @@ class ESPConfigView(ctk.CTkFrame):
             ))
 
         all_done = all(self.controller.esp_nodes[node_id].get(s, False) for s in CALIB_STATES)
-        if all_done and not self.controller.model_state.get(node_id, False) and not self.controller.training_in_progress.get(node_id, False):
+        splits_ready = self._auto_training_splits_ready(node_id)
+        if all_done and splits_ready and not self.controller.model_state.get(node_id, False) and not self.controller.training_in_progress.get(node_id, False):
             self.controller.all_logs.append((ts, "Model", f"Auto-training triggered for {node_id}"))
             if self.current_node_id == node_id:
                 self._safe_configure(
@@ -1514,11 +2044,19 @@ class ESPConfigView(ctk.CTkFrame):
             popup.geometry("420x140")
             ctk.CTkLabel(
                 popup,
-                text=f"All calibration states complete for {node_id}.\nStarting model training...",
+                text=f"All calibration states and train/dev splits are complete for {node_id}.\nStarting model training...",
                 font=("Arial", 14)
             ).pack(pady=22)
             ctk.CTkButton(popup, text="OK", width=90, command=popup.destroy).pack()
             self.train_model(node_id)
+        elif all_done and not splits_ready:
+            if self.current_node_id == node_id:
+                self._safe_configure(
+                    self.status_lbl_ref,
+                    text="Status: Waiting for both train and dev splits to be ready",
+                    text_color="#ff9800"
+                )
+            self.controller.all_logs.append((ts, "Model", f"Auto-training held for {node_id}: train/dev splits not ready"))
         elif all_done and self.controller.training_in_progress.get(node_id, False):
             self.controller.all_logs.append((ts, "Model", f"Training already running for {node_id}; skipping duplicate trigger"))
 
@@ -1636,6 +2174,21 @@ class ESPConfigView(ctk.CTkFrame):
             for state in self.controller.esp_nodes[node]:
                 self.controller.esp_nodes[node][state] = False
             self.controller.model_state[node] = False
+            self.controller.collection_campaign.pop(node, None)
+            self.controller.collection_run_counter.pop(node, None)
+            self.controller.last_split_choice.pop(node, None)
+
+        # reset should also clear the collected CSI files for the active node(s)
+        # so the displayed per-label counts actually return to zero.
+        try:
+            data_base = self._resolve_data_base()
+            for node_id in self.controller.esp_nodes:
+                node_dir = os.path.join(str(data_base), str(node_id))
+                if os.path.isdir(node_dir):
+                    shutil.rmtree(node_dir)
+        except Exception as e:
+            ts = datetime.now().strftime('%H:%M:%S')
+            self.controller.all_logs.append((ts, 'Action', f'Failed to clear CSI data during reset: {e}'))
         try:
             if os.path.exists(CALIB_FILE):
                 os.remove(CALIB_FILE)
@@ -1682,7 +2235,10 @@ class GraphsView(ctk.CTkFrame):
                 if not os.path.isdir(state_dir):
                     continue
                 ctk.CTkLabel(self.scroll, text="  "+state, font=("Arial",16)).pack(anchor="w", padx=10)
-                files = sorted(glob.glob(os.path.join(state_dir, "*.csv")))
+                files = sorted(
+                    path for path in glob.glob(os.path.join(state_dir, "**", "*.csv"), recursive=True)
+                    if os.path.isfile(path) and not os.path.basename(path).startswith("part_")
+                )
                 for f in files:
                     b = ctk.CTkButton(self.scroll, text=os.path.basename(f), anchor="w",
                                       command=lambda f=f: self.plot_file(f))

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Path to your virtual environment (adjust if it's elsewhere)
-VENV_PATH="./venv/bin/activate"
+VENV_PATH="~/inf2009_venv/bin/activate"
 
 # Launch Script 1
 lxterminal -e "bash -c 'source $VENV_PATH && python3 dashboard.py; exec bash'" &

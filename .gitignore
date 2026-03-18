@@ -10,7 +10,7 @@ model_store/RACK_1/model.tflite
 model_store/RACK_1/scaler_params.json
 models.json
 view_state.json
-
+keys.json
 # Environment variables — never commit real credentials
 .env
 
@@ -25,3 +25,5 @@ model_store/_tmp/
 
 # Windows
 Thumbs.db
+
+model_store/
