@@ -63,8 +63,8 @@ CALIB_STATES = ["door_closed", "door_open", "person_standing"]
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # default to local server output path; can still be overridden in Settings
 CSI_DATA_DIR = os.path.join(BASE_DIR, "csi_data")
-TRAINING_SCRIPT = os.path.join(BASE_DIR, "train_model.py")
-NOTEBOOK_TRAINING_FILE = os.path.join(BASE_DIR, "Edge_ML.ipynb")
+TRAINING_SCRIPT = os.path.join(BASE_DIR, "edge_ml.py")
+NOTEBOOK_TRAINING_FILE = os.path.join(BASE_DIR, "Edge_ML (1).ipynb")
 NOTEBOOK_MODEL_FILE = os.path.join(BASE_DIR, "model (1).tflite")
 MODEL_STORE_DIR = os.path.join(BASE_DIR, "model_store")
 
@@ -128,6 +128,8 @@ class GovernanceApp(ctk.CTk):
         self.model_state = {node_id: False for node_id in self.esp_nodes}
         # prevent duplicate concurrent training triggers per node
         self.training_in_progress = {node_id: False for node_id in self.esp_nodes}
+        # suppress repeated "auto-training held" log spam until split readiness changes
+        self.auto_training_hold_logged = {node_id: False for node_id in self.esp_nodes}
         # latest inferred state per node (published by ESP)
         self.node_detected_state = {node_id: "" for node_id in self.esp_nodes}
         # configuration state
@@ -607,7 +609,18 @@ class GovernanceApp(ctk.CTk):
                 elif evt == "model_ready":
                     self.model_state[node_id] = True
                     self._save_model_state()
-                    self.all_logs.append((ts, "Model", f"{node_id} reported model_ready"))
+                    input_elements = payload_json.get("input_elements")
+                    window_size = payload_json.get("window_size")
+                    if isinstance(input_elements, (int, float)) and isinstance(window_size, (int, float)):
+                        self.all_logs.append(
+                            (
+                                ts,
+                                "Model",
+                                f"{node_id} reported model_ready (input_elements={int(input_elements)}, window_size={int(window_size)})",
+                            )
+                        )
+                    else:
+                        self.all_logs.append((ts, "Model", f"{node_id} reported model_ready"))
 
                     cfg = None
                     if "MainDashboard" in self.frames:
@@ -646,6 +659,76 @@ class GovernanceApp(ctk.CTk):
                                 pass
 
                         self.after(0, _show_model_failed)
+                elif evt == "model_download_incompatible":
+                    self.model_state[node_id] = False
+                    self._save_model_state()
+
+                    reason = payload_json.get("reason", "unknown")
+                    input_elements = payload_json.get("input_elements", "?")
+                    feature_count = payload_json.get("feature_count", "?")
+                    self.all_logs.append(
+                        (
+                            ts,
+                            "Model",
+                            f"{node_id} model incompatible: reason={reason}, input_elements={input_elements}, feature_count={feature_count}",
+                        )
+                    )
+
+                    cfg = None
+                    if "MainDashboard" in self.frames:
+                        subs = self.frames["MainDashboard"].sub_frames
+                        cfg = subs.get("ESP32-C3 Configuration")
+                    if cfg and cfg.current_node_id == node_id:
+                        def _show_model_incompatible():
+                            try:
+                                cfg._safe_configure(
+                                    cfg.status_lbl_ref,
+                                    text=f"Status: Model incompatible ({reason})",
+                                    text_color="red",
+                                )
+                            except Exception:
+                                pass
+
+                        self.after(0, _show_model_incompatible)
+                elif evt == "model_download_memory_error":
+                    self.model_state[node_id] = False
+                    self._save_model_state()
+
+                    asset = payload_json.get("asset", "unknown")
+                    reason = payload_json.get("reason", "unspecified")
+                    attempt = payload_json.get("attempt", "?")
+                    requested = payload_json.get("requested_bytes", "?")
+                    free_heap = payload_json.get("free_heap", "?")
+                    largest_block = payload_json.get("largest_block", "?")
+                    err_name = payload_json.get("err_name", "UNKNOWN")
+
+                    self.all_logs.append(
+                        (
+                            ts,
+                            "Model",
+                            f"{node_id} model download memory error [{asset}/{reason}] "
+                            f"attempt={attempt} req={requested} free={free_heap} largest={largest_block} err={err_name}",
+                        )
+                    )
+
+                    cfg = None
+                    if "MainDashboard" in self.frames:
+                        subs = self.frames["MainDashboard"].sub_frames
+                        cfg = subs.get("ESP32-C3 Configuration")
+                    if cfg and cfg.current_node_id == node_id:
+                        def _show_model_oom():
+                            try:
+                                cfg._safe_configure(
+                                    cfg.status_lbl_ref,
+                                    text=(
+                                        f"Status: Model download OOM ({asset}, free={free_heap}, largest={largest_block})"
+                                    ),
+                                    text_color="red",
+                                )
+                            except Exception:
+                                pass
+
+                        self.after(0, _show_model_oom)
             except json.JSONDecodeError:
                 pass
         
@@ -999,7 +1082,7 @@ class ESPConfigView(ctk.CTkFrame):
         return result["ok"]
 
     def _ask_calibration_mode(self, node_id: str, state: str, split_group: str) -> str:
-        """Ask user whether to append, replace, or reset calibration data."""
+        """Ask user whether to append, replace, reset, or cancel calibration data."""
         popup = ctk.CTkToplevel(self)
         popup.title("Calibration conflict")
         popup.geometry("520x220")
@@ -1337,7 +1420,7 @@ class ESPConfigView(ctk.CTkFrame):
                 if label not in summary["labels"]:
                     continue
 
-                row_count = int(manifest.get("row_count", 0) or 0)
+                row_count = int(manifest.get("row_count", 0))
                 split_group = manifest.get("split_group", "train")
                 if split_group not in {"train", "dev", "test"}:
                     split_group = "train"
@@ -1563,12 +1646,12 @@ class ESPConfigView(ctk.CTkFrame):
 
             ctk.CTkLabel(row, text=state, text_color="black", font=("Arial", 14)).pack(side="left")
             info = live_summary.get("labels", {}).get(state, {})
-            row_count = int(info.get("rows_raw", 0) or 0)
-            file_count = int(info.get("files", 0) or 0)
+            row_count = int(info.get("rows_raw", 0))
+            file_count = int(info.get("files", 0))
             split_files = info.get("split_files", {}) if isinstance(info, dict) else {}
-            train_files = int(split_files.get("train", 0) or 0)
-            dev_files = int(split_files.get("dev", 0) or 0)
-            test_files = int(split_files.get("test", 0) or 0)
+            train_files = int(split_files.get("train", 0))
+            dev_files = int(split_files.get("dev", 0))
+            test_files = int(split_files.get("test", 0))
             count_text = (
                 f"{file_count} file{'s' if file_count != 1 else ''}, {row_count} row{'s' if row_count != 1 else ''} "
                 f"| train: {train_files}, dev: {dev_files}, test: {test_files}"
@@ -1600,20 +1683,18 @@ class ESPConfigView(ctk.CTkFrame):
             self.detail_widgets.append(self.train_btn_ref)
 
     def _auto_training_splits_ready(self, node_id):
-        """Return True when train and dev both have at least one file per label.
+        """Return True when each calibration label has at least one dataset file.
 
-        Auto-training should only begin once the current node has completed all
-        calibration states and both training splits are populated. Test is still
-        optional for the workflow in this project.
+        Notebook-aligned training performs its own train/test split internally,
+        so dashboard auto-training should gate on label coverage instead of
+        external train/dev collection splits.
         """
         summary = self._build_live_dataset_summary(node_id) or {}
         labels = summary.get("labels", {})
-        for split_name in ("train", "dev"):
-            for state in CALIB_STATES:
-                info = labels.get(state, {})
-                split_files = info.get("split_files", {}) if isinstance(info, dict) else {}
-                if int(split_files.get(split_name, 0) or 0) <= 0:
-                    return False
+        for state in CALIB_STATES:
+            info = labels.get(state, {})
+            if int(info.get("files", 0)) <= 0:
+                return False
         return True
 
     def _resolve_data_base(self):
@@ -2032,6 +2113,7 @@ class ESPConfigView(ctk.CTkFrame):
         all_done = all(self.controller.esp_nodes[node_id].get(s, False) for s in CALIB_STATES)
         splits_ready = self._auto_training_splits_ready(node_id)
         if all_done and splits_ready and not self.controller.model_state.get(node_id, False) and not self.controller.training_in_progress.get(node_id, False):
+            self.controller.auto_training_hold_logged[node_id] = False
             self.controller.all_logs.append((ts, "Model", f"Auto-training triggered for {node_id}"))
             if self.current_node_id == node_id:
                 self._safe_configure(
@@ -2044,7 +2126,7 @@ class ESPConfigView(ctk.CTkFrame):
             popup.geometry("420x140")
             ctk.CTkLabel(
                 popup,
-                text=f"All calibration states and train/dev splits are complete for {node_id}.\nStarting model training...",
+                text=f"All calibration states have captured data for {node_id}.\nStarting model training...",
                 font=("Arial", 14)
             ).pack(pady=22)
             ctk.CTkButton(popup, text="OK", width=90, command=popup.destroy).pack()
@@ -2053,12 +2135,17 @@ class ESPConfigView(ctk.CTkFrame):
             if self.current_node_id == node_id:
                 self._safe_configure(
                     self.status_lbl_ref,
-                    text="Status: Waiting for both train and dev splits to be ready",
+                    text="Status: Waiting for all labels to have captured data",
                     text_color="#ff9800"
                 )
-            self.controller.all_logs.append((ts, "Model", f"Auto-training held for {node_id}: train/dev splits not ready"))
+            if not self.controller.auto_training_hold_logged.get(node_id, False):
+                self.controller.all_logs.append((ts, "Model", f"Auto-training held for {node_id}: missing label data"))
+                self.controller.auto_training_hold_logged[node_id] = True
         elif all_done and self.controller.training_in_progress.get(node_id, False):
+            self.controller.auto_training_hold_logged[node_id] = False
             self.controller.all_logs.append((ts, "Model", f"Training already running for {node_id}; skipping duplicate trigger"))
+        else:
+            self.controller.auto_training_hold_logged[node_id] = False
 
         # remove the stored expectations (if any)
         self.controller.expected_calib.pop(node_id, None)

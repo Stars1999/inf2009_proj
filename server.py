@@ -4,6 +4,7 @@ import pandas as pd
 import os
 import glob
 import json
+import shutil
 import threading
 import time
 import zlib
@@ -161,6 +162,7 @@ def _update_session_manifest(
 def on_mqtt_connect(client, userdata, flags, rc):
     if rc == 0:
         client.subscribe("/commands/+/collect")
+        client.subscribe("/sensors/+/status")
         print("MQTT connected. Listening on /commands/+/collect")
     else:
         print(f"MQTT connection failed: {rc}")
@@ -168,6 +170,37 @@ def on_mqtt_connect(client, userdata, flags, rc):
 
 def on_mqtt_message(client, userdata, message):
     topic_parts = message.topic.strip("/").split("/")
+    if len(topic_parts) == 3 and topic_parts[0] == "sensors" and topic_parts[2] == "status":
+        node_id = topic_parts[1]
+        raw = message.payload.decode(errors="replace").strip()
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+
+        if isinstance(payload, dict) and payload.get("event") == "model_download_memory_error":
+            print(
+                "[MODEL DOWNLOAD OOM] "
+                f"node={node_id} asset={payload.get('asset', '?')} reason={payload.get('reason', '?')} "
+                f"attempt={payload.get('attempt', '?')} req={payload.get('requested_bytes', '?')} "
+                f"free={payload.get('free_heap', '?')} largest={payload.get('largest_block', '?')} "
+                f"err={payload.get('err_name', payload.get('err', '?'))}"
+            )
+        elif isinstance(payload, dict) and payload.get("event") == "model_download_incompatible":
+            print(
+                "[MODEL INCOMPATIBLE] "
+                f"node={node_id} reason={payload.get('reason', '?')} "
+                f"input_elements={payload.get('input_elements', '?')} feature_count={payload.get('feature_count', '?')}"
+            )
+        elif isinstance(payload, dict) and payload.get("event") == "model_ready":
+            if "input_elements" in payload or "window_size" in payload:
+                print(
+                    "[MODEL READY] "
+                    f"node={node_id} bytes={payload.get('bytes', '?')} "
+                    f"input_elements={payload.get('input_elements', '?')} window_size={payload.get('window_size', '?')}"
+                )
+        return
+
     if len(topic_parts) == 3 and topic_parts[0] == "commands" and topic_parts[2] == "collect":
         node_id = topic_parts[1]
         if not node_id or node_id == "None":
@@ -371,25 +404,6 @@ def upload_data():
         except ValueError:
             return "Invalid CRC header", 400
         if computed_crc != received_crc:
-            return f"CRC mismatch: got {crc_header}, expected {computed_crc:08x}", 422
-
-    # Idempotency: if we already processed this chunk, ensure payload matches
-    if idem_key:
-        with _active_sessions_lock:
-            entry = _seen_idempotency_keys.get(idem_key)
-        if entry is not None:
-            _, stored_crc = entry
-            if stored_crc == computed_crc:
-                return jsonify({"status": "duplicate", "accepted": False}), 200
-            return jsonify({"status": "conflict", "accepted": False, "reason": "payload mismatch"}), 409
-
-    # Debug: Log CRC mismatch details when it occurs so we can track down firmware issues
-    if crc_header:
-        try:
-            received_crc = int(crc_header, 16)
-        except ValueError:
-            return "Invalid CRC header", 400
-        if computed_crc != received_crc:
             print(
                 f"[CRC MISMATCH] node={esp32_id} label={room_state} session={sess} "
                 f"part={sub_batch_idx}/{total_sub_batches} received_crc={crc_header} expected={computed_crc:08x} "
@@ -407,6 +421,25 @@ def upload_data():
                 "length": len(raw_data),
             }), 422
 
+    # Idempotency: if we already processed this chunk, ensure payload matches.
+    # Scope the cache key by node/label so parallel collections across racks
+    # never collide when they share the same session/sub-batch key format.
+    scoped_idem_key = None
+    if idem_key:
+        scoped_idem_key = f"{esp32_id}|{room_state}|{idem_key}"
+        with _active_sessions_lock:
+            entry = _seen_idempotency_keys.get(scoped_idem_key)
+        if entry is not None:
+            _, stored_crc = entry
+            if stored_crc == computed_crc:
+                return jsonify({"status": "duplicate", "accepted": False}), 200
+            print(
+                f"[IDEMPOTENCY CONFLICT] node={esp32_id} label={room_state} session={sess} "
+                f"part={sub_batch_idx}/{total_sub_batches} idem={idem_key} "
+                f"stored_crc={stored_crc:08x} received_crc={computed_crc:08x}"
+            )
+            return jsonify({"status": "conflict", "accepted": False, "reason": "payload mismatch"}), 409
+
     # Validation: The ESP32 sends a buffer of SUB_BATCH_SIZE
     expected_size = SUB_BATCH_SIZE * SUB_COUNT
     
@@ -415,9 +448,9 @@ def upload_data():
         return "Wrong Size", 400
 
     # Register this idempotency key now that the payload is valid
-    if idem_key:
+    if scoped_idem_key:
         with _active_sessions_lock:
-            _seen_idempotency_keys[idem_key] = (time.time(), computed_crc)
+            _seen_idempotency_keys[scoped_idem_key] = (time.time(), computed_crc)
 
     # Periodically cleanup old incomplete session directories.
     # This keeps the store from accumulating stale "in-progress" partial uploads.

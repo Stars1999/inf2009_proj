@@ -45,16 +45,16 @@ python dashboard.py    # terminal 2: UI + MQTT orchestration
 
 ## Model training (notebook + CLI)
 
-`Edge_ML.ipynb` is kept as the reference notebook for feature selection,
-normalization, model architecture, and TFLite conversion.
+`Edge_ML (1).ipynb` is the source-of-truth for model training behavior.
 
-The canonical training script is the repository-root `train_model.py`.
+The canonical production trainer is `edge_ml.py` (a CLI-aligned version of the
+notebook logic).
 
-`dashboard.py` calls `train_model.py` after calibration is complete. You can
-also run it manually:
+`dashboard.py` calls `edge_ml.py` after calibration is complete. You can also
+run it manually:
 
 ```bash
-python train_model.py \
+python edge_ml.py \
   --data-dir csi_data \
   --node RACK_1 \
   --output model_store/_tmp/RACK_1/model.tflite \
@@ -64,15 +64,16 @@ python train_model.py \
 The script:
 
 * loads CSVs from `csi_data/<node>/<state>/...` recursively,
-* uses notebook-compatible features (`SC_4..SC_59` excluding `SC_32`),
-* trains a compact dense classifier and exports `.tflite`,
-* emits `scaler_params.json` in `{"mean": [...], "std": [...]}` format.
+* keeps notebook feature-selection behavior (variance threshold on `SC_4..SC_59`, excluding `SC_32`),
+* appends the notebook variation feature (`AVG_VARIATION`),
+* trains the notebook dense classifier and exports strict int8 `.tflite`,
+* emits `scaler_params.json` with `mean/std` arrays and notebook metadata used by ESP32 inference.
 
 ### ESP32-C3 limitations
 
-* Keep models compact (warning threshold is ~100 KB in the trainer).
-* Keep input feature count fixed to the notebook-compatible set (55 features).
-* Prefer early stopping / modest model depth to reduce RAM and CPU load.
+* Keep models compact (int8 export and early stopping help memory use).
+* Feature count is data-dependent (variance-selected subcarriers + 1 variation feature).
+* Ensure model and scaler are updated together for each node.
 
 ## Notes
 
