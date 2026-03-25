@@ -29,7 +29,7 @@ STATE_TO_LABEL: Dict[str, int] = {
 TARGET_NAMES = ["door_open", "door_closed", "person_standing"]
 
 MAX_LOWER = 4
-MAX_UPPER = 59
+MAX_UPPER = 60
 DC_NULL = 32
 RAW_COLS = [f"SC_{i}" for i in range(MAX_LOWER, MAX_UPPER + 1) if i != DC_NULL]
 
@@ -43,24 +43,49 @@ def _import_tf():
         ) from exc
 
 
+def _import_tfmot():
+    try:
+        return importlib.import_module("tensorflow_model_optimization")
+    except Exception as exc:
+        raise RuntimeError(
+            "TensorFlow Model Optimization Toolkit import failed. Install tensorflow-model-optimization."
+        ) from exc
+
+
 def extract_features(
     df: pd.DataFrame,
     feature_cols: List[str],
     window_size: int = 5,
     session_offset: float = 0.0,
     calibration_val: float | None = None,
+    group_count: int = 0,
 ) -> np.ndarray:
     """Notebook-equivalent feature extraction."""
     raw_data = df[feature_cols].to_numpy(dtype=np.float32)
     calibrated_data = raw_data + float(session_offset)
     num_rows = calibrated_data.shape[0]
     all_features: List[np.ndarray] = []
+    group_indices: List[np.ndarray] = []
+
+    if int(group_count) > 0 and int(group_count) < calibrated_data.shape[1]:
+        group_indices = [g for g in np.array_split(np.arange(calibrated_data.shape[1]), int(group_count)) if len(g) > 0]
 
     for i in range(num_rows):
         start = max(0, i - int(window_size) + 1)
         window = calibrated_data[start:i + 1, :]
-        current_frame = calibrated_data[i, :]
-        temp_std = np.std(window, axis=0)
+        if group_indices:
+            grouped_window = np.stack(
+                [
+                    np.asarray([np.mean(row[idx]) for idx in group_indices], dtype=np.float32)
+                    for row in window
+                ],
+                axis=0,
+            )
+            current_frame = grouped_window[-1, :]
+            temp_std = np.std(grouped_window, axis=0)
+        else:
+            current_frame = calibrated_data[i, :]
+            temp_std = np.std(window, axis=0)
         avg_variation = float(np.mean(temp_std))
 
         if calibration_val is not None:
@@ -126,8 +151,9 @@ def _load_state_df(base_dir: str, node: str, state: str) -> pd.DataFrame:
 
         missing = [c for c in RAW_COLS if c not in df.columns]
         if missing:
-            print(f"[WARN] Skipping CSV missing required notebook columns: {path}")
-            continue
+            print(f"[WARN] CSV missing columns {missing[:4]}{'...' if len(missing) > 4 else ''}: {path} (zero-filling)")
+            for col in missing:
+                df[col] = 0.0
 
         rows.append(df[RAW_COLS].copy())
 
@@ -170,8 +196,16 @@ def _save_scaler_params(
     train_mean: float,
     cal_frames: int,
     feature_window: int,
+    group_count: int,
+    optimization_meta: Dict[str, object],
 ) -> None:
-    feature_columns = list(feature_cols) + ["AVG_VARIATION"]
+    if int(group_count) > 0 and int(group_count) < len(feature_cols):
+        feature_columns = [f"GROUP_{i}" for i in range(int(group_count))] + ["AVG_VARIATION"]
+        feature_mode = "grouped"
+    else:
+        feature_columns = list(feature_cols) + ["AVG_VARIATION"]
+        feature_mode = "selected_subcarriers"
+
     selected_subcarriers: List[int] = []
     for col in feature_cols:
         if col.startswith("SC_"):
@@ -190,6 +224,7 @@ def _save_scaler_params(
         "feature_columns": feature_columns,
         "selected_subcarriers": selected_subcarriers,
         "label_order": TARGET_NAMES,
+        "optimization": optimization_meta,
         "notebook_alignment": {
             "calibration_frames": int(cal_frames),
             "extract_window_size": int(feature_window),
@@ -198,6 +233,8 @@ def _save_scaler_params(
             "variation_feature": "mean(std(window, axis=0))",
             "use_session_offset": True,
             "session_offset_formula": "offset = train_mean - session_raw_mean",
+            "feature_mode": feature_mode,
+            "group_count": int(group_count),
         },
     }
 
@@ -220,6 +257,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature-window", type=int, default=5)
     parser.add_argument("--calibration-frames", type=int, default=20)
     parser.add_argument("--variance-threshold", type=float, default=0.1)
+    parser.add_argument("--feature-condense-groups", type=int, default=0,
+                        help="Optional feature condensation into N averaged groups before training (0 disables)")
+    parser.add_argument("--enable-pruning", action="store_true",
+                        help="Enable PASO pruning fine-tuning before TFLite export")
+    parser.add_argument("--pruning-sparsity", type=float, default=0.5,
+                        help="Target final sparsity for magnitude pruning (0.0-0.95)")
+    parser.add_argument("--pruning-finetune-epochs", type=int, default=30,
+                        help="Fine-tuning epochs for pruning stage")
+    parser.add_argument("--max-accuracy-drop", type=float, default=0.01,
+                        help="Maximum allowed absolute accuracy drop after pruning")
 
     # accepted for compatibility with previous dashboard invocation
     parser.add_argument("--notebook", default="")
@@ -236,7 +283,13 @@ def main() -> int:
         print(f"[INFO] Loading dataset node={args.node} from {args.data_dir}")
         df_open, df_close, df_person = _load_dataset(args.data_dir, args.node)
 
+        feature_group_count = max(0, int(args.feature_condense_groups))
+
         feature_cols = _select_feature_cols(df_open, df_close, df_person, threshold=args.variance_threshold)
+        if feature_group_count > 0:
+            # Grouped mode must align with firmware-side grouping over the full CSI span.
+            feature_cols = list(RAW_COLS)
+            print(f"[INFO] PASO grouped feature mode enabled: groups={feature_group_count}, source_features={len(feature_cols)}")
 
         df_open = df_open[feature_cols].copy()
         df_close = df_close[feature_cols].copy()
@@ -252,7 +305,6 @@ def main() -> int:
 
         cal_frames = max(1, int(args.calibration_frames))
         feature_window = max(1, int(args.feature_window))
-
         open_calibration_seed = df_open.head(cal_frames)
         if open_calibration_seed.empty:
             raise RuntimeError("door_open calibration frames are empty; cannot compute train baseline")
@@ -264,6 +316,7 @@ def main() -> int:
                     feature_cols,
                     window_size=feature_window,
                     calibration_val=None,
+                    group_count=feature_group_count,
                 )[:, -1]
             )
         )
@@ -273,6 +326,7 @@ def main() -> int:
             feature_cols,
             window_size=feature_window,
             calibration_val=train_baseline,
+            group_count=feature_group_count,
         )
         y = df_combined["label"].to_numpy(dtype=np.int32)
 
@@ -292,7 +346,7 @@ def main() -> int:
         print(f"[INFO] Testing set shape: {x_test.shape}")
 
         model = build_model(tf, x_train.shape[1])
-        print("[INFO] Starting model training...")
+        print("[INFO] Starting baseline model training...")
         model.fit(
             x_train,
             y_train,
@@ -308,10 +362,100 @@ def main() -> int:
             ],
         )
 
-        test_loss, test_acc = model.evaluate(x_test, y_test, verbose=0)
-        print(f"[INFO] Test loss={test_loss:.5f}, acc={test_acc:.5f}")
+        baseline_loss, baseline_acc = model.evaluate(x_test, y_test, verbose=0)
+        print(f"[INFO] Baseline test loss={baseline_loss:.5f}, acc={baseline_acc:.5f}")
 
-        y_pred_probs = model.predict(x_test, verbose=0)
+        final_model = model
+        final_loss = baseline_loss
+        final_acc = baseline_acc
+        optimization_meta: Dict[str, object] = {
+            "pruning_enabled": False,
+            "pruning_target_sparsity": 0.0,
+            "baseline_acc": float(baseline_acc),
+            "final_acc": float(baseline_acc),
+            "max_accuracy_drop": float(args.max_accuracy_drop),
+        }
+
+        if args.enable_pruning:
+            tfmot = _import_tfmot()
+            pruning_epochs = max(1, int(args.pruning_finetune_epochs))
+            final_sparsity = float(args.pruning_sparsity)
+            if final_sparsity < 0.0:
+                final_sparsity = 0.0
+            if final_sparsity > 0.95:
+                final_sparsity = 0.95
+
+            steps_per_epoch = max(1, int(np.ceil(len(x_train) / max(1, int(args.batch_size)))))
+            end_step = steps_per_epoch * pruning_epochs
+
+            pruning_params = {
+                "pruning_schedule": tfmot.sparsity.keras.PolynomialDecay(
+                    initial_sparsity=0.0,
+                    final_sparsity=final_sparsity,
+                    begin_step=0,
+                    end_step=end_step,
+                    frequency=100,
+                )
+            }
+
+            pruned_model = tfmot.sparsity.keras.prune_low_magnitude(model, **pruning_params)
+            pruned_model.compile(
+                optimizer=tf.keras.optimizers.Adam(0.0005),
+                loss="sparse_categorical_crossentropy",
+                metrics=["accuracy"],
+            )
+
+            print(
+                f"[INFO] Starting pruning fine-tuning: sparsity_target={final_sparsity:.2f}, epochs={pruning_epochs}"
+            )
+            pruned_model.fit(
+                x_train,
+                y_train,
+                validation_data=(x_test, y_test),
+                epochs=pruning_epochs,
+                batch_size=int(args.batch_size),
+                verbose=0,
+                callbacks=[
+                    tfmot.sparsity.keras.UpdatePruningStep(),
+                    tf.keras.callbacks.EarlyStopping(
+                        patience=max(2, min(10, int(args.patience))),
+                        restore_best_weights=True,
+                    ),
+                ],
+            )
+
+            stripped_model = tfmot.sparsity.keras.strip_pruning(pruned_model)
+            stripped_model.compile(
+                optimizer=tf.keras.optimizers.Adam(0.0005),
+                loss="sparse_categorical_crossentropy",
+                metrics=["accuracy"],
+            )
+
+            prune_loss, prune_acc = stripped_model.evaluate(x_test, y_test, verbose=0)
+            drop = float(baseline_acc - prune_acc)
+            print(
+                f"[INFO] Pruned test loss={prune_loss:.5f}, acc={prune_acc:.5f}, acc_drop={drop:.5f}"
+            )
+
+            if drop > float(args.max_accuracy_drop):
+                raise RuntimeError(
+                    f"Pruning accuracy guardrail violated: drop={drop:.5f} > max={float(args.max_accuracy_drop):.5f}"
+                )
+
+            final_model = stripped_model
+            final_loss = prune_loss
+            final_acc = prune_acc
+            optimization_meta.update(
+                {
+                    "pruning_enabled": True,
+                    "pruning_target_sparsity": float(final_sparsity),
+                    "pruning_finetune_epochs": int(pruning_epochs),
+                    "final_acc": float(final_acc),
+                    "accuracy_drop": float(drop),
+                }
+            )
+
+        y_pred_probs = final_model.predict(x_test, verbose=0)
         y_pred = np.argmax(y_pred_probs, axis=1)
         cm = confusion_matrix(y_test, y_pred)
         print("[INFO] Confusion Matrix:")
@@ -319,7 +463,9 @@ def main() -> int:
         print("[INFO] Classification Report:")
         print(classification_report(y_test, y_pred, target_names=["open", "close", "person"], zero_division=0))
 
-        converter = tf.lite.TFLiteConverter.from_keras_model(model)
+        print(f"[INFO] Final model loss={final_loss:.5f}, acc={final_acc:.5f}")
+
+        converter = tf.lite.TFLiteConverter.from_keras_model(final_model)
         converter.optimizations = [tf.lite.Optimize.DEFAULT]
         converter.representative_dataset = lambda: _representative_dataset_gen(x_train, max_samples=100)
         converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
@@ -350,6 +496,8 @@ def main() -> int:
             train_mean=train_mean,
             cal_frames=cal_frames,
             feature_window=feature_window,
+            group_count=feature_group_count,
+            optimization_meta=optimization_meta,
         )
 
         print(f"[INFO] Wrote TFLite model: {args.output} ({os.path.getsize(args.output)} bytes)")

@@ -68,6 +68,13 @@ NOTEBOOK_TRAINING_FILE = os.path.join(BASE_DIR, "Edge_ML (1).ipynb")
 NOTEBOOK_MODEL_FILE = os.path.join(BASE_DIR, "model (1).tflite")
 MODEL_STORE_DIR = os.path.join(BASE_DIR, "model_store")
 
+# PASO optimization defaults (override with environment variables when needed)
+PASO_ENABLE_PRUNING = os.getenv("PASO_ENABLE_PRUNING", "1").strip().lower() in ("1", "true", "yes")
+PASO_PRUNING_SPARSITY = float(os.getenv("PASO_PRUNING_SPARSITY", "0.5"))
+PASO_PRUNING_FINETUNE_EPOCHS = int(os.getenv("PASO_PRUNING_FINETUNE_EPOCHS", "30"))
+PASO_MAX_ACCURACY_DROP = float(os.getenv("PASO_MAX_ACCURACY_DROP", "0.01"))
+PASO_FEATURE_CONDENSE_GROUPS = int(os.getenv("PASO_FEATURE_CONDENSE_GROUPS", "8"))
+
 # legacy behaviour: fall back to local directory if CSI_DATA_DIR doesn’t exist
 
 CONFIG_FILE = "config.json"  # persists broker/port/csi directory
@@ -77,16 +84,6 @@ CALIB_FILE = "calib_states.json"           # per-node completed flags
 KEYS_FILE = "keys.json"                    # issued/in vault status
 VIEW_FILE = "view_state.json"              # last page/node
 MODEL_FILE = "models.json"                # per-node model validity flag
-# Liveliness policy: the ESP32 publishes a lightweight heartbeat every 60s,
-# so the UI treats recent messages as online, then degrades to stale, then
-# offline if silence continues.
-HEARTBEAT_INTERVAL_SECONDS = 60
-ONLINE_TTL_SECONDS = int(HEARTBEAT_INTERVAL_SECONDS * 1.5)
-STALE_TTL_SECONDS = HEARTBEAT_INTERVAL_SECONDS * 3
-
-# Periodic presence refresh is intentionally low frequency to avoid busy UI
-# polling when nothing is changing.
-LIVENESS_TICK_SECONDS = 15
 
 
 if not os.path.exists(LOG_DIR):
@@ -161,9 +158,6 @@ class GovernanceApp(ctk.CTk):
         # refresh on resize so child views can redraw properly
         self.bind("<Configure>", self._on_resize)
 
-        # periodic liveness check to keep connection status accurate
-        self.after(LIVENESS_TICK_SECONDS * 1000, self._liveness_tick)
-
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         self.client.on_connect = self.on_connect
         self.client.on_disconnect = self.on_disconnect
@@ -178,6 +172,7 @@ class GovernanceApp(ctk.CTk):
     def on_connect(self, client, userdata, flags, reason_code, properties):
         try:
             client.subscribe("#", qos=1)
+            client.subscribe("device/+/status", qos=1)
             ts = datetime.now().strftime("%H:%M:%S")
             self.all_logs.append((ts, "MQTT", f"Connected (reason_code={reason_code})"))
         except Exception as e:
@@ -191,42 +186,14 @@ class GovernanceApp(ctk.CTk):
             self.node_online[node_id] = False
 
     def _node_presence_state(self, node_id):
-        """Return the node presence state: online, stale, or offline."""
-        last_seen = self.node_last_seen.get(node_id, 0)
-        if not last_seen:
-            return "offline"
-
-        age = time.time() - last_seen
-        if self.node_online.get(node_id, False):
-            if age <= ONLINE_TTL_SECONDS:
-                return "online"
-            if age <= STALE_TTL_SECONDS:
-                return "stale"
-        return "offline"
+        """Return node presence state driven by explicit device status topic."""
+        return "online" if self.node_online.get(node_id, False) else "offline"
 
     @staticmethod
     def _presence_colors(state):
         if state == "online":
             return "#2e7d32"
-        if state == "stale":
-            return "#ff9800"
         return "gray"
-
-    def _liveness_tick(self):
-        """Periodic check to expire nodes that have stopped reporting."""
-        now = time.time()
-        changed = False
-        for node_id in list(self.node_online.keys()):
-            last = self.node_last_seen.get(node_id, 0)
-            if self.node_online.get(node_id, False) and last and (now - last) > STALE_TTL_SECONDS:
-                self.node_online[node_id] = False
-                changed = True
-        # Refresh the config view if status changed (e.g. connection went down)
-        if changed and self.last_view == "ESP32-C3 Configuration":
-            cfg = self.frames.get("MainDashboard").sub_frames.get("ESP32-C3 Configuration")
-            if cfg and cfg.current_node_id:
-                cfg.refresh()
-        self.after(LIVENESS_TICK_SECONDS * 1000, self._liveness_tick)
 
     def _publish_collect_with_retry(self, node_id, label, split_group="train", retries=3):
         if not node_id or str(node_id) == "None" or node_id not in self.esp_nodes:
@@ -483,6 +450,23 @@ class GovernanceApp(ctk.CTk):
         now_epoch = time.time()
         self.all_logs.append((ts, msg.topic, payload))
 
+        topic = msg.topic.strip()
+        if topic.startswith("device/") and topic.endswith("/status"):
+            topic_parts = topic.split("/")
+            node_id = topic_parts[1] if len(topic_parts) >= 3 else "unknown"
+            status_payload = payload.strip().lower()
+
+            if status_payload == "online":
+                self.node_last_seen[node_id] = now_epoch
+                self.node_online[node_id] = True
+                print(f"\033[92m[SYSTEM] Node {node_id} is ONLINE\033[0m")
+                self.all_logs.append((ts, "SYSTEM", f"Node {node_id} is ONLINE"))
+            elif status_payload == "offline":
+                self.node_last_seen[node_id] = now_epoch
+                self.node_online[node_id] = False
+                print(f"\033[91m[ALERT] Node {node_id} is OFFLINE\033[0m")
+                self.all_logs.append((ts, "ALERT", f"Node {node_id} is OFFLINE"))
+
         completion_node = None
         completion_state = None
         completion_session = None
@@ -491,17 +475,10 @@ class GovernanceApp(ctk.CTk):
         topic_parts = msg.topic.strip("/").split("/")
         if len(topic_parts) == 3 and topic_parts[0] == "sensors" and topic_parts[2] == "status":
             node_id = topic_parts[1]
-            # update health timestamp for this node
-            self.node_last_seen[node_id] = now_epoch
-            self.node_online[node_id] = True
             try:
                 payload_json = json.loads(payload)
                 evt = payload_json.get("event")
-                if evt == "node_offline":
-                    self.node_online[node_id] = False
-                elif evt == "node_online":
-                    self.node_online[node_id] = True
-
+                if evt == "node_online":
                     # Accept model status updates when the node first joins.
                     mr = payload_json.get("model_ready")
                     if isinstance(mr, bool):
@@ -895,16 +872,9 @@ class HomeView(ctk.CTkFrame):
         total_keys = len(self.controller.keys)
         issued_keys = sum(1 for status in self.controller.keys.values() if status == "out")
         vault_keys = sum(1 for status in self.controller.keys.values() if status == "in")
-        online = 0
-        stale = 0
-        for node_id in self.controller.esp_nodes:
-            presence = self.controller._node_presence_state(node_id)
-            if presence == "online":
-                online += 1
-            elif presence == "stale":
-                stale += 1
+        online = sum(1 for node_id in self.controller.esp_nodes if self.controller._node_presence_state(node_id) == "online")
         total_nodes = len(self.controller.esp_nodes)
-        offline = total_nodes - online - stale
+        offline = total_nodes - online
         # Define stats list with calculated values
         stats = [
             (str(total_keys), "Total Keys"), 
@@ -912,7 +882,6 @@ class HomeView(ctk.CTkFrame):
             (str(vault_keys), "Key In Vault"),
             (str(total_nodes), "Total ESP32-C3"), 
             (str(online), "ESP32-C3 Online"), 
-            (str(stale), "ESP32-C3 Stale"),
             (str(offline), "ESP32-C3 Offline")
         ]
 
@@ -1307,8 +1276,7 @@ class ESPConfigView(ctk.CTkFrame):
                 text_color=self.controller._presence_colors(presence),
             )
 
-        # Show a "last seen" timestamp only once a node has been missing for a
-        # short while (to avoid flicker during brief heartbeat gaps).
+        # Show the last device-status update time for offline nodes.
         if self.last_seen_label:
             last_seen = self.controller.node_last_seen.get(node_id, 0)
             presence = self.controller._node_presence_state(node_id)
@@ -1787,6 +1755,18 @@ class ESPConfigView(ctk.CTkFrame):
             "--notebook", NOTEBOOK_TRAINING_FILE,
             "--notebook-model", NOTEBOOK_MODEL_FILE,
         ]
+
+        if PASO_ENABLE_PRUNING:
+            cmd.extend([
+                "--enable-pruning",
+                "--pruning-sparsity", str(PASO_PRUNING_SPARSITY),
+                "--pruning-finetune-epochs", str(PASO_PRUNING_FINETUNE_EPOCHS),
+                "--max-accuracy-drop", str(PASO_MAX_ACCURACY_DROP),
+            ])
+        if PASO_FEATURE_CONDENSE_GROUPS > 0:
+            cmd.extend([
+                "--feature-condense-groups", str(PASO_FEATURE_CONDENSE_GROUPS),
+            ])
 
         # disable the train button to prevent re‑entry
         self._safe_configure(self.train_btn_ref, state="disabled")

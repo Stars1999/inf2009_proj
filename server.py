@@ -8,9 +8,18 @@ import shutil
 import threading
 import time
 import zlib
+import queue
+import struct
 import paho.mqtt.client as mqtt
 from datetime import datetime
 from dotenv import load_dotenv
+
+try:
+    from line_profiler import profile
+except Exception:
+    # Fallback no-op decorator so production runtime works without line_profiler.
+    def profile(func):
+        return func
 
 app = Flask(__name__)
 
@@ -60,6 +69,13 @@ IDEMPOTENCY_TTL_SECONDS = 600  # 10 minutes
 # used while a multi-part upload is being collected.
 SESSION_DIR_TTL_SECONDS = 600  # 10 minutes
 SESSION_CLEANUP_INTERVAL_SECONDS = 300  # run cleanup every 5 minutes
+
+# PASO phase constants and toggles
+PASO_INFERENCE_BUDGET_US = int(os.getenv("PASO_INFERENCE_BUDGET_US", "50000"))
+PASO_END_TO_END_BUDGET_US = int(os.getenv("PASO_END_TO_END_BUDGET_US", "500000"))
+PASO_ASYNC_FINALIZE_ENABLED = os.getenv("PASO_ASYNC_FINALIZE", "1").strip().lower() in ("1", "true", "yes")
+PASO_FINALIZE_QUEUE_SIZE = int(os.getenv("PASO_FINALIZE_QUEUE_SIZE", "32"))
+PERF_BIN_STRUCT = struct.Struct("<BBHIIIIIiiiiI")
 
 
 def _json_load(path: str, default):
@@ -163,12 +179,80 @@ def on_mqtt_connect(client, userdata, flags, rc):
     if rc == 0:
         client.subscribe("/commands/+/collect")
         client.subscribe("/sensors/+/status")
+        client.subscribe("/sensors/+/perf_bin")
+        client.subscribe("device/+/status")
         print("MQTT connected. Listening on /commands/+/collect")
     else:
         print(f"MQTT connection failed: {rc}")
 
 
+@profile
 def on_mqtt_message(client, userdata, message):
+    topic = message.topic.strip()
+
+    topic_parts = topic.strip("/").split("/")
+    if len(topic_parts) == 3 and topic_parts[0] == "sensors" and topic_parts[2] == "perf_bin":
+        raw = bytes(message.payload)
+        node_id = topic_parts[1]
+
+        if len(raw) != PERF_BIN_STRUCT.size:
+            print(f"[PASO PERF] node={node_id} invalid payload size={len(raw)} expected={PERF_BIN_STRUCT.size}")
+            return
+
+        try:
+            (
+                version,
+                _reserved,
+                payload_size,
+                invoke_last_us,
+                invoke_avg_us,
+                invoke_min_us,
+                invoke_max_us,
+                sample_count,
+                queue_wait_us,
+                feature_us,
+                invoke_stage_us,
+                pipeline_total_us,
+                free_heap,
+            ) = PERF_BIN_STRUCT.unpack(raw)
+        except struct.error as e:
+            print(f"[PASO PERF] node={node_id} unpack error: {e}")
+            return
+
+        if version != 1:
+            print(f"[PASO PERF] node={node_id} unsupported version={version}")
+            return
+        if payload_size != PERF_BIN_STRUCT.size:
+            print(f"[PASO PERF] node={node_id} payload_size mismatch header={payload_size} expected={PERF_BIN_STRUCT.size}")
+
+        print(
+            "[PASO PERF] "
+            f"node={node_id} invoke_us(last={invoke_last_us},avg={invoke_avg_us},min={invoke_min_us},max={invoke_max_us},n={sample_count}) "
+            f"stage_us(wait={queue_wait_us},feature={feature_us},invoke={invoke_stage_us},total={pipeline_total_us}) "
+            f"free_heap={free_heap}"
+        )
+
+        if invoke_avg_us > PASO_INFERENCE_BUDGET_US:
+            print(
+                f"[PASO ALERT] node={node_id} inference avg {invoke_avg_us}us exceeds budget {PASO_INFERENCE_BUDGET_US}us"
+            )
+        if pipeline_total_us > PASO_END_TO_END_BUDGET_US:
+            print(
+                f"[PASO ALERT] node={node_id} pipeline total {pipeline_total_us}us exceeds budget {PASO_END_TO_END_BUDGET_US}us"
+            )
+        return
+
+    if topic.startswith("device/") and topic.endswith("/status"):
+        topic_parts = topic.split("/")
+        node_id = topic_parts[1] if len(topic_parts) >= 3 else "unknown"
+        status_payload = message.payload.decode(errors="replace").strip().lower()
+
+        if status_payload == "online":
+            print(f"\033[92m[SYSTEM] Node {node_id} is ONLINE\033[0m")
+        elif status_payload == "offline":
+            print(f"\033[91m[ALERT] Node {node_id} is OFFLINE\033[0m")
+        return
+
     topic_parts = message.topic.strip("/").split("/")
     if len(topic_parts) == 3 and topic_parts[0] == "sensors" and topic_parts[2] == "status":
         node_id = topic_parts[1]
@@ -284,8 +368,186 @@ def publish_status_event(topic: str, payload: str, qos: int = 1) -> bool:
     return True
 
 
+def _finalize_session_artifacts(job: dict) -> None:
+    session_dir = job["session_dir"]
+    esp32_id = job["esp32_id"]
+    room_state = job["room_state"]
+    split_group = job["split_group"]
+    campaign_slug = job["campaign_slug"]
+    run_slug = job["run_slug"]
+    campaign_id = job["campaign_id"]
+    run_id = job["run_id"]
+    sess = job["sess"]
+    completed_label = job.get("completed_label", room_state)
+    total_sub_batches = int(job["total_sub_batches"])
+
+    existing_parts = glob.glob(os.path.join(session_dir, "part_*.csv"))
+    if len(existing_parts) < total_sub_batches:
+        print(
+            f"[FINALIZE] Skip finalize for {esp32_id}/{room_state} session={sess}: "
+            f"parts={len(existing_parts)}/{total_sub_batches}"
+        )
+        return
+
+    print(f"FULL BATCH RECEIVED: Merging {total_sub_batches} parts for {esp32_id}/{room_state} session={sess}")
+    existing_parts.sort()
+    full_df_list = [pd.read_csv(f) for f in existing_parts]
+    combined_df = pd.concat(full_df_list, ignore_index=True)
+
+    manifest = _json_load(_session_manifest_path(session_dir), {})
+
+    timestamp = datetime.now().strftime('%m-%d_%H-%M-%S')
+    final_filename = os.path.join(
+        SAVE_DIR,
+        esp32_id,
+        room_state,
+        f"csi_{room_state}_{split_group}_{timestamp}.csv",
+    )
+    combined_df.to_csv(final_filename, index=False)
+
+    final_manifest_filename = _final_manifest_path(
+        esp32_id,
+        room_state,
+        split_group,
+        campaign_slug,
+        run_slug,
+        timestamp,
+    )
+    manifest.update(
+        {
+            "merged_at": datetime.now().isoformat(timespec='seconds'),
+            "final_csv": final_filename,
+            "final_manifest": final_manifest_filename,
+            "row_count": int(len(combined_df)),
+            "feature_count": int(SUB_COUNT),
+            "sub_batch_count": int(total_sub_batches),
+            "campaign_id": campaign_id,
+            "run_id": run_id,
+            "split_group": split_group,
+        }
+    )
+    _json_save(final_manifest_filename, manifest)
+
+    for f in existing_parts:
+        try:
+            os.remove(f)
+        except Exception:
+            pass
+    try:
+        os.rmdir(session_dir)
+    except OSError:
+        pass
+
+    payload = json.dumps(
+        {
+            "event": "collection_complete",
+            "label": completed_label,
+            "session": sess,
+            "campaign_id": campaign_id,
+            "run_id": run_id,
+            "split_group": split_group,
+            "source": "server",
+        }
+    )
+    if mqtt_client is not None:
+        print(f"Publishing collection_complete for {esp32_id} (session={sess})")
+        ok = publish_status_event(f"/sensors/{esp32_id}/status", payload, qos=1)
+        if not ok:
+            print(f"WARNING: publish collection_complete failed for {esp32_id} (session={sess})")
+    else:
+        print("WARNING: mqtt_client is None, cannot publish collection_complete")
+
+    with _active_sessions_lock:
+        info = active_sessions.get(esp32_id)
+        if isinstance(info, dict) and info.get("session") == sess:
+            active_sessions.pop(esp32_id, None)
+
+    print(f"SAVED: {final_filename} with {len(combined_df)} rows.")
+
+
 def _node_model_dir(node_id: str) -> str:
     return os.path.join(MODEL_STORE_DIR, node_id)
+
+
+_cleanup_thread_started = False
+_cleanup_thread_lock = threading.Lock()
+_finalize_worker_started = False
+_finalize_worker_lock = threading.Lock()
+_finalize_queue: "queue.Queue[dict]" = queue.Queue(maxsize=PASO_FINALIZE_QUEUE_SIZE)
+_finalize_inflight_lock = threading.Lock()
+_finalize_inflight_sessions: set[str] = set()
+
+
+def _run_finalize_overflow(job: dict) -> None:
+    key = job.get("session_dir", "")
+    started_us = time.perf_counter_ns() // 1000
+    try:
+        _finalize_session_artifacts(job)
+    except Exception as e:
+        print(f"[FINALIZE] overflow worker error: {e}")
+    finally:
+        elapsed_us = (time.perf_counter_ns() // 1000) - started_us
+        if elapsed_us > PASO_END_TO_END_BUDGET_US:
+            print(
+                f"[PASO ALERT] overflow finalize exceeded budget: {elapsed_us}us > {PASO_END_TO_END_BUDGET_US}us"
+            )
+        with _finalize_inflight_lock:
+            if key:
+                _finalize_inflight_sessions.discard(key)
+
+
+def _enqueue_finalize_session(job: dict) -> bool:
+    key = job.get("session_dir", "")
+    if not key:
+        return False
+
+    with _finalize_inflight_lock:
+        if key in _finalize_inflight_sessions:
+            return True
+        _finalize_inflight_sessions.add(key)
+
+    try:
+        _finalize_queue.put_nowait(job)
+        return True
+    except queue.Full:
+        print(f"[FINALIZE] queue is full (max={PASO_FINALIZE_QUEUE_SIZE}); using detached overflow worker")
+        threading.Thread(
+            target=_run_finalize_overflow,
+            args=(job,),
+            daemon=True,
+            name="finalize-overflow",
+        ).start()
+        return False
+
+
+def _finalize_worker_loop() -> None:
+    while True:
+        job = _finalize_queue.get()
+        key = job.get("session_dir", "")
+        started_us = time.perf_counter_ns() // 1000
+        try:
+            _finalize_session_artifacts(job)
+        except Exception as e:
+            print(f"[FINALIZE] worker error: {e}")
+        finally:
+            elapsed_us = (time.perf_counter_ns() // 1000) - started_us
+            if elapsed_us > PASO_END_TO_END_BUDGET_US:
+                print(
+                    f"[PASO ALERT] finalize job exceeded budget: {elapsed_us}us > {PASO_END_TO_END_BUDGET_US}us"
+                )
+            with _finalize_inflight_lock:
+                if key:
+                    _finalize_inflight_sessions.discard(key)
+            _finalize_queue.task_done()
+
+
+def _start_finalize_worker() -> None:
+    global _finalize_worker_started
+    with _finalize_worker_lock:
+        if _finalize_worker_started:
+            return
+        _finalize_worker_started = True
+    threading.Thread(target=_finalize_worker_loop, daemon=True, name="finalize-worker").start()
 
 
 @app.route('/model/<node_id>', methods=['GET'])
@@ -334,6 +596,8 @@ def get_scaler_params(node_id):
 
 @app.route('/upload_data', methods=['POST'])
 def upload_data():
+    upload_start_us = time.perf_counter_ns() // 1000
+
     room_state = request.headers.get('X-Room-State', 'unknown')
     esp32_id = request.headers.get('X-ESP32-ID', '0')
     sub_batch_idx = int(request.headers.get('X-Sub-Batch-Index', -1))
@@ -511,86 +775,56 @@ def upload_data():
 
     # Only merge when ALL parts have arrived
     if len(existing_parts) == total_sub_batches:
-        print(f"FULL BATCH RECEIVED: Merging {total_sub_batches} parts...")
-        
-        # Sort files by name to ensure sequence (part_000, part_001, etc)
-        existing_parts.sort()
-        
-        # Merge all parts into one large dataframe
-        full_df_list = [pd.read_csv(f) for f in existing_parts]
-        combined_df = pd.concat(full_df_list, ignore_index=True)
-
-        # Keep a compact manifest alongside the merged CSV so the session
-        # can be audited after the temporary sub-batch directory is removed.
-        manifest = _json_load(_session_manifest_path(session_dir), {})
-        
-        # Save final combined CSV with timestamp
-        timestamp = datetime.now().strftime('%m-%d_%H-%M-%S')
-        final_filename = os.path.join(
-            SAVE_DIR,
-            esp32_id,
-            room_state,
-            f"csi_{room_state}_{split_group}_{timestamp}.csv",
-        )
-        combined_df.to_csv(final_filename, index=False)
-        final_manifest_filename = _final_manifest_path(esp32_id, room_state, split_group, campaign_slug, run_slug, timestamp)
-        manifest.update(
-            {
-                "merged_at": datetime.now().isoformat(timespec='seconds'),
-                "final_csv": final_filename,
-                "final_manifest": final_manifest_filename,
-                "row_count": int(len(combined_df)),
-                "feature_count": int(SUB_COUNT),
-                "sub_batch_count": int(total_sub_batches),
-                "campaign_id": campaign_id,
-                "run_id": run_id,
-                "split_group": split_group,
-            }
-        )
-        _json_save(final_manifest_filename, manifest)
-        
-        # Cleanup: Remove temporary parts and their directory
-        for f in existing_parts:
-            os.remove(f)
-        try:
-            os.rmdir(session_dir)
-        except OSError:
-            pass # Directory might not be empty if another batch started simultaneously
-
+        completed_label = room_state
         if isinstance(info, dict):
             completed_label = info.get("label", room_state)
         elif isinstance(info, str):
             completed_label = info
-        payload = json.dumps({
-            "event": "collection_complete",
-            "label": completed_label,
-            "session": sess,
+
+        finalize_job = {
+            "session_dir": session_dir,
+            "esp32_id": esp32_id,
+            "room_state": room_state,
+            "split_group": split_group,
+            "campaign_slug": campaign_slug,
+            "run_slug": run_slug,
             "campaign_id": campaign_id,
             "run_id": run_id,
-            "split_group": split_group,
-            "source": "server",
-        })
-        if mqtt_client is not None:
-            print(f"Publishing collection_complete for {esp32_id} (session={sess})")
-            ok = publish_status_event(f"/sensors/{esp32_id}/status", payload, qos=1)
-            if not ok:
-                print(f"WARNING: publish collection_complete failed for {esp32_id} (session={sess})")
-        else:
-            print("WARNING: mqtt_client is None, cannot publish collection_complete")
-        with _active_sessions_lock:
-            active_sessions.pop(esp32_id, None)
-        
-        print(f"SAVED: {final_filename} with {len(combined_df)} rows.")
+            "sess": sess,
+            "completed_label": completed_label,
+            "total_sub_batches": total_sub_batches,
+        }
+
+        queued = False
+        if PASO_ASYNC_FINALIZE_ENABLED:
+            queued = _enqueue_finalize_session(finalize_job)
+            if queued:
+                print(
+                    f"[FINALIZE] queued async finalize for {esp32_id}/{room_state} session={sess}"
+                )
+
+        if not queued:
+            if PASO_ASYNC_FINALIZE_ENABLED:
+                print(f"[FINALIZE] overflow finalize launched for {esp32_id}/{room_state} session={sess}")
+            else:
+                _finalize_session_artifacts(finalize_job)
+
+    upload_total_us = (time.perf_counter_ns() // 1000) - upload_start_us
+    if upload_total_us > PASO_END_TO_END_BUDGET_US:
+        print(
+            f"[PASO ALERT] /upload_data request time exceeded budget: "
+            f"{upload_total_us}us > {PASO_END_TO_END_BUDGET_US}us"
+        )
     
     return "OK", 200
-
-_cleanup_thread_started = False
-_cleanup_thread_lock = threading.Lock()
 
 
 def start_server(host=os.getenv("SERVER_HOST", "0.0.0.0"), port=int(os.getenv("SERVER_PORT", "5000"))):
     # Ensure the background cleanup thread is running before we start serving.
     _start_cleanup_thread()
+
+    if PASO_ASYNC_FINALIZE_ENABLED:
+        _start_finalize_worker()
 
     # initialize MQTT with whatever broker/port have been configured
     init_mqtt()
