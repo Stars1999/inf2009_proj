@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""Enhanced CSI model training entrypoint.
+"""Notebook-aligned CSI model training entrypoint.
 
-Improvements over baseline:
-- Class weighting for imbalance handling
-- Enhanced temporal features (max_variation, amplitude_range, trend)
-- Reduced model size with L2 regularization
-- Per-class evaluation metrics
-- Stratified K-fold cross-validation option
+This file is the productionized form of `Edge_ML (1).ipynb` and keeps the same
+modeling logic (variance-selected subcarriers, temporal variation feature,
+StandardScaler, dense Keras classifier, and full-int8 TFLite export).
 """
 
 import argparse
@@ -19,10 +16,9 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import classification_report, confusion_matrix, f1_score
+from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.utils.class_weight import compute_class_weight
 from shared_config import (
     MAX_LOWER,
     MAX_UPPER,
@@ -68,13 +64,8 @@ def extract_features(
     session_offset: float = 0.0,
     calibration_val: float | None = None,
     group_count: int = 0,
-    enhanced_temporal: bool = True,
 ) -> np.ndarray:
-    """Enhanced feature extraction with additional temporal features.
-    
-    Args:
-        enhanced_temporal: If True, adds max_variation, amplitude_range, and trend features
-    """
+    """Notebook-equivalent feature extraction."""
     raw_data = df[feature_cols].to_numpy(dtype=np.float32)
     calibrated_data = raw_data + float(session_offset)
     num_rows = calibrated_data.shape[0]
@@ -88,6 +79,8 @@ def extract_features(
     if use_vectorized:
         w = max(1, int(window_size))
         padded = np.vstack([np.repeat(calibrated_data[:1], w - 1, axis=0), calibrated_data])
+        # sliding_window_view is a view (no full copy) but downstream reductions can
+        # still touch large memory regions; keep this path for moderate dataset sizes.
         windows = np.lib.stride_tricks.sliding_window_view(
             padded,
             window_shape=(w, calibrated_data.shape[1]),
@@ -95,40 +88,13 @@ def extract_features(
         current_frames = calibrated_data
         temp_std = windows.std(axis=1)
         avg_variation = temp_std.mean(axis=1)
-        
-        temporal_features = [avg_variation[:, None].astype(np.float32)]
-        
-        if enhanced_temporal:
-            # Max variation: peak temporal change per frame
-            max_variation = temp_std.max(axis=1)
-            temporal_features.append(max_variation[:, None].astype(np.float32))
-            
-            # Amplitude range: max - min per frame
-            amplitude_range = (windows.max(axis=1) - windows.min(axis=1)).mean(axis=1)
-            temporal_features.append(amplitude_range[:, None].astype(np.float32))
-            
-            # Trend: simple slope over window
-            time_points = np.arange(w).astype(np.float32)
-            # For vectorized: compute slope for each column
-            slopes = []
-            for i in range(num_rows):
-                window_data = windows[i]  # shape (w, n_features)
-                # Simple slope: (last - first) / time_span
-                slope = np.mean((window_data[-1] - window_data[0]) / (w - 1))
-                slopes.append(slope)
-            trend = np.array(slopes, dtype=np.float32)
-            temporal_features.append(trend[:, None])
-        
         if calibration_val is not None:
-            # Normalize first temporal feature (avg_variation)
-            temporal_features[0] = temporal_features[0] / (float(calibration_val) + 1e-8)
-        
-        return np.concatenate([current_frames] + temporal_features, axis=1)
+            avg_variation = avg_variation / (float(calibration_val) + 1e-8)
+        return np.concatenate([current_frames, avg_variation[:, None].astype(np.float32)], axis=1)
 
     for i in range(num_rows):
         start = max(0, i - int(window_size) + 1)
         window = calibrated_data[start:i + 1, :]
-        
         if group_indices:
             grouped_window = np.stack(
                 [
@@ -142,31 +108,12 @@ def extract_features(
         else:
             current_frame = calibrated_data[i, :]
             temp_std = np.std(window, axis=0)
-        
         avg_variation = float(np.mean(temp_std))
-        
+
         if calibration_val is not None:
             avg_variation = avg_variation / (float(calibration_val) + 1e-8)
-        
-        temporal_data = [avg_variation]
-        
-        if enhanced_temporal:
-            # Max variation
-            max_variation = float(np.max(temp_std))
-            temporal_data.append(max_variation)
-            
-            # Amplitude range
-            amplitude_range = float(np.mean(np.max(window, axis=0) - np.min(window, axis=0)))
-            temporal_data.append(amplitude_range)
-            
-            # Trend slope
-            if window.shape[0] > 1:
-                trend = float((window[-1].mean() - window[0].mean()) / (window.shape[0] - 1))
-            else:
-                trend = 0.0
-            temporal_data.append(trend)
-        
-        feat = np.concatenate([current_frame, np.asarray(temporal_data, dtype=np.float32)])
+
+        feat = np.concatenate([current_frame, np.asarray([avg_variation], dtype=np.float32)])
         all_features.append(feat)
 
     return np.asarray(all_features, dtype=np.float32)
@@ -182,29 +129,15 @@ def _representative_dataset_gen(x_calib: np.ndarray, max_samples: int = 100):
 
 
 def build_model(tf, input_dim: int):
-    """Improved model: smaller with L2 regularization.
-    
-    Changes from baseline:
-    - Reduced from 256→128→64 to 128→64
-    - Added L2 regularization (0.01)
-    - Increased dropout rates for better generalization
-    """
     model = tf.keras.Sequential([
         tf.keras.layers.Input(shape=(input_dim,)),
-        tf.keras.layers.Dense(
-            128, 
-            activation="relu",
-            kernel_regularizer=tf.keras.regularizers.l2(0.01)
-        ),
+        tf.keras.layers.Dense(256, activation="relu"),
         tf.keras.layers.BatchNormalization(),
-        tf.keras.layers.Dropout(0.5),
-        tf.keras.layers.Dense(
-            64, 
-            activation="relu",
-            kernel_regularizer=tf.keras.regularizers.l2(0.01)
-        ),
+        tf.keras.layers.Dropout(0.4),
+        tf.keras.layers.Dense(128, activation="relu"),
         tf.keras.layers.BatchNormalization(),
-        tf.keras.layers.Dropout(0.3),
+        tf.keras.layers.Dropout(0.2),
+        tf.keras.layers.Dense(64, activation="relu"),
         tf.keras.layers.Dense(3, activation="softmax"),
     ])
     model.compile(
@@ -287,16 +220,12 @@ def _save_scaler_params(
     feature_window: int,
     group_count: int,
     optimization_meta: Dict[str, object],
-    enhanced_temporal: bool = True,
 ) -> None:
     if int(group_count) > 0 and int(group_count) < len(feature_cols):
-        feature_columns = [f"GROUP_{i}" for i in range(int(group_count))] + ["AVG_VARIATION", "MAX_VARIATION", "AMPLITUDE_RANGE", "TREND"] if enhanced_temporal else [f"GROUP_{i}" for i in range(int(group_count))] + ["AVG_VARIATION"]
+        feature_columns = [f"GROUP_{i}" for i in range(int(group_count))] + ["AVG_VARIATION"]
         feature_mode = FEATURE_MODE_GROUPED
     else:
-        if enhanced_temporal:
-            feature_columns = list(feature_cols) + ["AVG_VARIATION", "MAX_VARIATION", "AMPLITUDE_RANGE", "TREND"]
-        else:
-            feature_columns = list(feature_cols) + ["AVG_VARIATION"]
+        feature_columns = list(feature_cols) + ["AVG_VARIATION"]
         feature_mode = FEATURE_MODE_SELECTED_SUBCARRIERS
 
     selected_subcarriers: List[int] = []
@@ -324,8 +253,6 @@ def _save_scaler_params(
             "train_baseline": float(train_baseline),
             "train_mean": float(train_mean),
             "variation_feature": "mean(std(window, axis=0))",
-            "enhanced_temporal_features": enhanced_temporal,
-            "temporal_features": ["avg_variation", "max_variation", "amplitude_range", "trend"] if enhanced_temporal else ["avg_variation"],
             "use_session_offset": True,
             "session_offset_formula": "offset = train_mean - session_raw_mean",
             "feature_mode": feature_mode,
@@ -412,8 +339,7 @@ def main() -> int:
                     window_size=feature_window,
                     calibration_val=None,
                     group_count=feature_group_count,
-                    enhanced_temporal=True,  # Use enhanced features
-                )[:, -4]  # Now: [subcarriers, avg_var, max_var, amplitude_range, trend]
+                )[:, -1]
             )
         )
 
@@ -423,7 +349,6 @@ def main() -> int:
             window_size=feature_window,
             calibration_val=train_baseline,
             group_count=feature_group_count,
-            enhanced_temporal=True,
         )
         y = df_combined["label"].to_numpy(dtype=np.int32)
 
@@ -441,25 +366,15 @@ def main() -> int:
 
         print(f"[INFO] Training set shape: {x_train.shape}")
         print(f"[INFO] Testing set shape: {x_test.shape}")
-        
-        # Calculate class weights to handle imbalance
-        class_weights = compute_class_weight(
-            'balanced',
-            classes=np.unique(y_train),
-            y=y_train
-        )
-        class_weight_dict = {i: float(w) for i, w in enumerate(class_weights)}
-        print(f"[INFO] Class weights: {class_weight_dict}")
 
         model = build_model(tf, x_train.shape[1])
-        print("[INFO] Starting improved model training with class weighting...")
+        print("[INFO] Starting baseline model training...")
         model.fit(
             x_train,
             y_train,
             validation_data=(x_test, y_test),
             epochs=int(args.epochs),
             batch_size=int(args.batch_size),
-            class_weight=class_weight_dict,  # KEY IMPROVEMENT: handle imbalance
             verbose=0,
             callbacks=[
                 tf.keras.callbacks.EarlyStopping(
@@ -471,16 +386,6 @@ def main() -> int:
 
         baseline_loss, baseline_acc = model.evaluate(x_test, y_test, verbose=0)
         print(f"[INFO] Baseline test loss={baseline_loss:.5f}, acc={baseline_acc:.5f}")
-        
-        # Enhanced evaluation: per-class metrics
-        y_pred = model.predict(x_test, verbose=0)
-        y_pred_classes = np.argmax(y_pred, axis=1)
-        print("\n[INFO] Per-Class Performance:")
-        print(classification_report(y_test, y_pred_classes, target_names=TARGET_NAMES))
-        
-        # Macro-averaged F1 (equal importance per class)
-        macro_f1 = f1_score(y_test, y_pred_classes, average='macro')
-        print(f"[INFO] Macro-averaged F1: {macro_f1:.5f}")
 
         final_model = model
         final_loss = baseline_loss
@@ -627,7 +532,6 @@ def main() -> int:
             feature_window=feature_window,
             group_count=feature_group_count,
             optimization_meta=optimization_meta,
-            enhanced_temporal=True,  # Include enhanced temporal features in metadata
         )
 
         print(f"[INFO] Wrote TFLite model: {args.output} ({os.path.getsize(args.output)} bytes)")
