@@ -60,6 +60,13 @@ def validate_scaler_schema(params: dict) -> tuple[bool, str]:
     if len(mean_vals) != len(std_vals):
         return False, "mean/std arrays must be the same length"
 
+    # Require label_order mapping from model outputs to human-readable labels
+    label_order = params.get("label_order")
+    if not isinstance(label_order, list) or len(label_order) == 0 or not all(
+        isinstance(l, str) for l in label_order
+    ):
+        return False, "scaler params must include non-empty label_order list mapping model outputs to labels"
+
     feature_columns = params.get("feature_columns")
     notebook_alignment = params.get("notebook_alignment")
     feature_count = len(mean_vals)
