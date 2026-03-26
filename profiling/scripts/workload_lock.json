@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "dataset": {
+    "node": "RACK_1",
+    "states": [
+      "door_closed",
+      "door_open",
+      "person_standing"
+    ],
+    "path_hint": "csi_data"
+  },
+  "microbench": {
+    "warmup_runs": 1,
+    "iterations": {
+      "summary_scan": 5,
+      "dataframe_build": 2000,
+      "extract_features": 3,
+      "merge_runs": 1
+    },
+    "merge_synthetic": {
+      "parts": 8,
+      "rows_per_part": 10000,
+      "sub_count": 56
+    },
+    "upload_endpoint": {
+      "default_iterations": 80,
+      "sub_batch_size": 40
+    }
+  },
+  "environment_lock": {
+    "python": "/home/iankoh/inf2009_venv/bin/python3",
+    "notes": "Run before and after captures on the same host and Python environment."
+  }
+}

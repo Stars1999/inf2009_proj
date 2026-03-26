@@ -1,29 +1,29 @@
 __pycache__/
-csi_data/
+*.py[cod]
+
+# Local runtime data
 .venv/
-PRD.md
-PROGRESS.md
+csi_data/
+model_store/
 calib_states.json
-model_store/_tmp/RACK_1/model.tflite
-model_store/_tmp/RACK_1/scaler_params.json
-model_store/RACK_1/model.tflite
-model_store/RACK_1/scaler_params.json
 models.json
 view_state.json
 keys.json
-# Environment variables — never commit real credentials
+heartbeat_state.json
+
+# Environment variables
 .env
 
-# Temporary / in-progress model artefacts
-model_store/_tmp/
+# Generated profiling outputs
+profiling/results/*.json
+profiling/results/*.csv
+profiling/results/*.md
+!profiling/results/.gitkeep
 
-# Log files
+# Temporary files
 *.log
+*.backup
 
-# macOS
+# OS files
 .DS_Store
-
-# Windows
 Thumbs.db
-
-model_store/

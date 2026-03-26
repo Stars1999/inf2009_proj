@@ -1,4 +1,4 @@
-absl-py==2.4.0
+absl-py==1.2.0
 astunparse==1.6.3
 blinker==1.9.0
 certifi==2026.2.25
@@ -28,6 +28,7 @@ MarkupSafe==3.0.3
 matplotlib==3.10.8
 mdurl==0.1.2
 ml_dtypes==0.5.4
+dm-tree==0.1.9
 namex==0.1.0
 numpy==2.4.3
 opt_einsum==3.4.0

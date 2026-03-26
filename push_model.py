@@ -29,6 +29,7 @@ import paho.mqtt.client as mqtt
 import time
 from pathlib import Path
 from dotenv import load_dotenv
+from shared_config import FEATURE_MODE_GROUPED
 
 load_dotenv()
 
@@ -59,15 +60,50 @@ def validate_scaler_schema(params: dict) -> tuple[bool, str]:
     if len(mean_vals) != len(std_vals):
         return False, "mean/std arrays must be the same length"
 
+    feature_columns = params.get("feature_columns")
+    notebook_alignment = params.get("notebook_alignment")
+    feature_count = len(mean_vals)
+
+    if isinstance(notebook_alignment, dict):
+        feature_mode = notebook_alignment.get("feature_mode")
+        group_count = notebook_alignment.get("group_count")
+        if feature_mode == FEATURE_MODE_GROUPED:
+            try:
+                if int(group_count) > 0 and int(group_count) + 1 == feature_count:
+                    return True, "ok"
+            except (TypeError, ValueError):
+                pass
+
     selected = params.get("selected_subcarriers")
     if isinstance(selected, list) and selected:
         if len(selected) + 1 != len(mean_vals):
-            return (
-                False,
-                "selected_subcarriers length must satisfy len(mean)==len(selected_subcarriers)+1 for notebook features",
-            )
+            # Legacy grouped layouts export the full raw subcarrier list, so a
+            # selected_subcarriers mismatch is only an error when the rest of the
+            # metadata does not describe a valid grouped layout.
+            pass
 
-    return True, "ok"
+    if isinstance(feature_columns, list) and len(feature_columns) == feature_count:
+        if len(feature_columns) > 1:
+            grouped_like = all(
+                isinstance(col, str) and col.startswith("GROUP_")
+                for col in feature_columns[:-1]
+            ) and feature_columns[-1] == "AVG_VARIATION"
+            notebook_like = all(
+                isinstance(col, str) and col.startswith("SC_")
+                for col in feature_columns[:-1]
+            ) and feature_columns[-1] == "AVG_VARIATION"
+
+            if grouped_like or notebook_like:
+                return True, "ok"
+
+    if isinstance(selected, list) and selected and len(selected) + 1 == feature_count:
+        return True, "ok"
+
+    return (
+        False,
+        "scaler params must describe either a grouped layout (feature_mode=grouped, group_count+1==len(mean)) "
+        "or a notebook/selected_subcarriers layout (len(selected_subcarriers)+1==len(mean))",
+    )
 
 
 def push_model_file(model_path, node_id):

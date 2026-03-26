@@ -19,6 +19,14 @@ import pandas as pd
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from shared_config import (
+    MAX_LOWER,
+    MAX_UPPER,
+    DC_NULL,
+    DEFAULT_FEATURE_WINDOW,
+    FEATURE_MODE_GROUPED,
+    FEATURE_MODE_SELECTED_SUBCARRIERS,
+)
 
 
 STATE_TO_LABEL: Dict[str, int] = {
@@ -28,9 +36,6 @@ STATE_TO_LABEL: Dict[str, int] = {
 }
 TARGET_NAMES = ["door_open", "door_closed", "person_standing"]
 
-MAX_LOWER = 4
-MAX_UPPER = 60
-DC_NULL = 32
 RAW_COLS = [f"SC_{i}" for i in range(MAX_LOWER, MAX_UPPER + 1) if i != DC_NULL]
 
 
@@ -69,6 +74,23 @@ def extract_features(
 
     if int(group_count) > 0 and int(group_count) < calibrated_data.shape[1]:
         group_indices = [g for g in np.array_split(np.arange(calibrated_data.shape[1]), int(group_count)) if len(g) > 0]
+    use_vectorized = (not group_indices) and num_rows > 0
+
+    if use_vectorized:
+        w = max(1, int(window_size))
+        padded = np.vstack([np.repeat(calibrated_data[:1], w - 1, axis=0), calibrated_data])
+        # sliding_window_view is a view (no full copy) but downstream reductions can
+        # still touch large memory regions; keep this path for moderate dataset sizes.
+        windows = np.lib.stride_tricks.sliding_window_view(
+            padded,
+            window_shape=(w, calibrated_data.shape[1]),
+        ).reshape(num_rows, w, calibrated_data.shape[1])
+        current_frames = calibrated_data
+        temp_std = windows.std(axis=1)
+        avg_variation = temp_std.mean(axis=1)
+        if calibration_val is not None:
+            avg_variation = avg_variation / (float(calibration_val) + 1e-8)
+        return np.concatenate([current_frames, avg_variation[:, None].astype(np.float32)], axis=1)
 
     for i in range(num_rows):
         start = max(0, i - int(window_size) + 1)
@@ -201,10 +223,10 @@ def _save_scaler_params(
 ) -> None:
     if int(group_count) > 0 and int(group_count) < len(feature_cols):
         feature_columns = [f"GROUP_{i}" for i in range(int(group_count))] + ["AVG_VARIATION"]
-        feature_mode = "grouped"
+        feature_mode = FEATURE_MODE_GROUPED
     else:
         feature_columns = list(feature_cols) + ["AVG_VARIATION"]
-        feature_mode = "selected_subcarriers"
+        feature_mode = FEATURE_MODE_SELECTED_SUBCARRIERS
 
     selected_subcarriers: List[int] = []
     for col in feature_cols:
@@ -254,7 +276,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--random-seed", type=int, default=42)
-    parser.add_argument("--feature-window", type=int, default=5)
+    parser.add_argument("--feature-window", type=int, default=DEFAULT_FEATURE_WINDOW)
     parser.add_argument("--calibration-frames", type=int, default=20)
     parser.add_argument("--variance-threshold", type=float, default=0.1)
     parser.add_argument("--feature-condense-groups", type=int, default=0,
@@ -377,83 +399,95 @@ def main() -> int:
         }
 
         if args.enable_pruning:
-            tfmot = _import_tfmot()
-            pruning_epochs = max(1, int(args.pruning_finetune_epochs))
-            final_sparsity = float(args.pruning_sparsity)
-            if final_sparsity < 0.0:
-                final_sparsity = 0.0
-            if final_sparsity > 0.95:
-                final_sparsity = 0.95
-
-            steps_per_epoch = max(1, int(np.ceil(len(x_train) / max(1, int(args.batch_size)))))
-            end_step = steps_per_epoch * pruning_epochs
-
-            pruning_params = {
-                "pruning_schedule": tfmot.sparsity.keras.PolynomialDecay(
-                    initial_sparsity=0.0,
-                    final_sparsity=final_sparsity,
-                    begin_step=0,
-                    end_step=end_step,
-                    frequency=100,
+            try:
+                tfmot = _import_tfmot()
+            except RuntimeError as exc:
+                print(f"[WARN] {exc} Continuing without pruning.")
+                optimization_meta.update(
+                    {
+                        "pruning_requested": True,
+                        "pruning_enabled": False,
+                        "pruning_skipped_reason": "tensorflow-model-optimization unavailable",
+                    }
                 )
-            }
+            else:
+                pruning_epochs = max(1, int(args.pruning_finetune_epochs))
+                final_sparsity = float(args.pruning_sparsity)
+                if final_sparsity < 0.0:
+                    final_sparsity = 0.0
+                if final_sparsity > 0.95:
+                    final_sparsity = 0.95
 
-            pruned_model = tfmot.sparsity.keras.prune_low_magnitude(model, **pruning_params)
-            pruned_model.compile(
-                optimizer=tf.keras.optimizers.Adam(0.0005),
-                loss="sparse_categorical_crossentropy",
-                metrics=["accuracy"],
-            )
+                steps_per_epoch = max(1, int(np.ceil(len(x_train) / max(1, int(args.batch_size)))))
+                end_step = steps_per_epoch * pruning_epochs
 
-            print(
-                f"[INFO] Starting pruning fine-tuning: sparsity_target={final_sparsity:.2f}, epochs={pruning_epochs}"
-            )
-            pruned_model.fit(
-                x_train,
-                y_train,
-                validation_data=(x_test, y_test),
-                epochs=pruning_epochs,
-                batch_size=int(args.batch_size),
-                verbose=0,
-                callbacks=[
-                    tfmot.sparsity.keras.UpdatePruningStep(),
-                    tf.keras.callbacks.EarlyStopping(
-                        patience=max(2, min(10, int(args.patience))),
-                        restore_best_weights=True,
-                    ),
-                ],
-            )
-
-            stripped_model = tfmot.sparsity.keras.strip_pruning(pruned_model)
-            stripped_model.compile(
-                optimizer=tf.keras.optimizers.Adam(0.0005),
-                loss="sparse_categorical_crossentropy",
-                metrics=["accuracy"],
-            )
-
-            prune_loss, prune_acc = stripped_model.evaluate(x_test, y_test, verbose=0)
-            drop = float(baseline_acc - prune_acc)
-            print(
-                f"[INFO] Pruned test loss={prune_loss:.5f}, acc={prune_acc:.5f}, acc_drop={drop:.5f}"
-            )
-
-            if drop > float(args.max_accuracy_drop):
-                raise RuntimeError(
-                    f"Pruning accuracy guardrail violated: drop={drop:.5f} > max={float(args.max_accuracy_drop):.5f}"
-                )
-
-            final_model = stripped_model
-            final_loss = prune_loss
-            final_acc = prune_acc
-            optimization_meta.update(
-                {
-                    "pruning_enabled": True,
-                    "pruning_target_sparsity": float(final_sparsity),
-                    "pruning_finetune_epochs": int(pruning_epochs),
-                    "final_acc": float(final_acc),
-                    "accuracy_drop": float(drop),
+                pruning_params = {
+                    "pruning_schedule": tfmot.sparsity.keras.PolynomialDecay(
+                        initial_sparsity=0.0,
+                        final_sparsity=final_sparsity,
+                        begin_step=0,
+                        end_step=end_step,
+                        frequency=100,
+                    )
                 }
-            )
+
+                pruned_model = tfmot.sparsity.keras.prune_low_magnitude(model, **pruning_params)
+                pruned_model.compile(
+                    optimizer=tf.keras.optimizers.Adam(0.0005),
+                    loss="sparse_categorical_crossentropy",
+                    metrics=["accuracy"],
+                )
+
+                print(
+                    f"[INFO] Starting pruning fine-tuning: sparsity_target={final_sparsity:.2f}, epochs={pruning_epochs}"
+                )
+                pruned_model.fit(
+                    x_train,
+                    y_train,
+                    validation_data=(x_test, y_test),
+                    epochs=pruning_epochs,
+                    batch_size=int(args.batch_size),
+                    verbose=0,
+                    callbacks=[
+                        tfmot.sparsity.keras.UpdatePruningStep(),
+                        tf.keras.callbacks.EarlyStopping(
+                            patience=max(2, min(10, int(args.patience))),
+                            restore_best_weights=True,
+                        ),
+                    ],
+                )
+
+                stripped_model = tfmot.sparsity.keras.strip_pruning(pruned_model)
+                stripped_model.compile(
+                    optimizer=tf.keras.optimizers.Adam(0.0005),
+                    loss="sparse_categorical_crossentropy",
+                    metrics=["accuracy"],
+                )
+
+                prune_loss, prune_acc = stripped_model.evaluate(x_test, y_test, verbose=0)
+                drop = float(baseline_acc - prune_acc)
+                print(
+                    f"[INFO] Pruned test loss={prune_loss:.5f}, acc={prune_acc:.5f}, acc_drop={drop:.5f}"
+                )
+
+                if drop > float(args.max_accuracy_drop):
+                    raise RuntimeError(
+                        f"Pruning accuracy guardrail violated: drop={drop:.5f} > max={float(args.max_accuracy_drop):.5f}"
+                    )
+
+                final_model = stripped_model
+                final_loss = prune_loss
+                final_acc = prune_acc
+                optimization_meta.update(
+                    {
+                        "pruning_requested": True,
+                        "pruning_enabled": True,
+                        "pruning_target_sparsity": float(final_sparsity),
+                        "pruning_finetune_epochs": int(pruning_epochs),
+                        "final_acc": float(final_acc),
+                        "accuracy_drop": float(drop),
+                    }
+                )
 
         y_pred_probs = final_model.predict(x_test, verbose=0)
         y_pred = np.argmax(y_pred_probs, axis=1)

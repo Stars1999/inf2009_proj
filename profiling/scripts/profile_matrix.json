@@ -1,0 +1,73 @@
+{
+  "scope": {
+    "project": "inf2009_proj",
+    "host_target": "Raspberry Pi 5",
+    "components": [
+      "dashboard.py",
+      "server.py",
+      "edge_ml.py"
+    ]
+  },
+  "tools": {
+    "perf_counter": {
+      "applicable": true,
+      "use_for": [
+        "Function-level elapsed timings",
+        "Endpoint request timing",
+        "Merge pipeline timing"
+      ]
+    },
+    "timeit": {
+      "applicable": true,
+      "use_for": [
+        "Repeatable Python microbenchmarks",
+        "DataFrame build path A/B",
+        "Feature extraction old-vs-new loop"
+      ]
+    },
+    "cProfile": {
+      "applicable": true,
+      "use_for": [
+        "Python call-stack attribution for hotspots",
+        "Upload endpoint call graph snapshots",
+        "Feature extraction call graph snapshots"
+      ]
+    },
+    "perf_stat": {
+      "applicable": true,
+      "use_for": [
+        "CPU counter deltas for before/after captures",
+        "Instruction/cycle/cache trend checks"
+      ]
+    },
+    "tracemalloc_rss": {
+      "applicable": true,
+      "use_for": [
+        "Python allocation peaks during finalize/merge",
+        "RSS growth sanity checks"
+      ]
+    },
+    "valgrind": {
+      "applicable": false,
+      "reason": "Primary scope is Python runtime hotspots; valgrind on CPython is high-noise and low-signal unless debugging native extension leaks."
+    }
+  },
+  "methodology": {
+    "before_after_strategy": "Use detached baseline git worktree and run identical harness/workload on baseline and current trees.",
+    "reproducibility_rules": [
+      "Same host and Python interpreter",
+      "Same dataset and synthetic workload dimensions",
+      "Warmup then repeated runs",
+      "Capture median and p95 in artifacts"
+    ],
+    "artifacts": [
+      "profiling/results/before_*.json",
+      "profiling/results/after_*.json",
+      "profiling/results/perf_before.csv",
+      "profiling/results/perf_after.csv",
+      "profiling/results/summary_table.csv",
+      "profiling/results/summary_table.md",
+      "profiling/results/runbook.md"
+    ]
+  }
+}

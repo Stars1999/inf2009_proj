@@ -13,6 +13,15 @@ import struct
 import paho.mqtt.client as mqtt
 from datetime import datetime
 from dotenv import load_dotenv
+from shared_config import (
+    MAX_LOWER,
+    MAX_UPPER,
+    DC_NULL,
+    CSI_HEADERS,
+    DEFAULT_MQTT_BROKER,
+    DEFAULT_MQTT_PORT,
+    DEFAULT_SUB_BATCH_SIZE,
+)
 
 try:
     from line_profiler import profile
@@ -26,26 +35,20 @@ app = Flask(__name__)
 load_dotenv()
 
 # --- CONFIGURATION (Must match ESP32 exactly) ---
-MAX_LOWER = 4
-MAX_UPPER = 60
-DC_NULL = 32
 # Note: BATCH_SIZE is only for validation of the FULL batch. 
 # On server, we care about SUB_BATCH_SIZE (e.g., 40)
-SUB_BATCH_SIZE = 40 
+SUB_BATCH_SIZE = DEFAULT_SUB_BATCH_SIZE
 # make directories relative to this script so moving repo won't break paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SAVE_DIR = os.path.join(BASE_DIR, "csi_data")
 MODEL_STORE_DIR = os.path.join(BASE_DIR, "model_store")
-MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
-MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_BROKER = DEFAULT_MQTT_BROKER
+MQTT_PORT = DEFAULT_MQTT_PORT
 
 os.makedirs(MODEL_STORE_DIR, exist_ok=True)
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # Calculate exactly how many bytes per packet based on the exclusion
-# create header names for every subcarrier index between lower and upper
-# inclusive, excluding the DC null carrier
-CSI_HEADERS = [f"SC_{i}" for i in range(MAX_LOWER, MAX_UPPER + 1) if i != DC_NULL]
 # match firmware definition: ACTIVE_SUBCARRIERS = (MAX_UPPER - MAX_LOWER) with DC excluded
 SUB_COUNT = len(CSI_HEADERS)
 ALLOWED_LABELS = {"door_closed", "door_open", "person_standing"}
@@ -69,6 +72,7 @@ IDEMPOTENCY_TTL_SECONDS = 600  # 10 minutes
 # used while a multi-part upload is being collected.
 SESSION_DIR_TTL_SECONDS = 600  # 10 minutes
 SESSION_CLEANUP_INTERVAL_SECONDS = 300  # run cleanup every 5 minutes
+FINALIZE_MERGE_CHUNK_SIZE = int(os.getenv("FINALIZE_MERGE_CHUNK_SIZE", "5000"))
 
 # PASO phase constants and toggles
 PASO_INFERENCE_BUDGET_US = int(os.getenv("PASO_INFERENCE_BUDGET_US", "50000"))
@@ -278,10 +282,26 @@ def on_mqtt_message(client, userdata, message):
             )
         elif isinstance(payload, dict) and payload.get("event") == "model_ready":
             if "input_elements" in payload or "window_size" in payload:
+                model_feature_count = payload.get("feature_count")
+                model_window_size = payload.get("window_size")
+                if isinstance(model_feature_count, (int, float)) and int(model_feature_count) != SUB_COUNT:
+                    print(
+                        "[CONFIG MISMATCH] "
+                        f"node={node_id} firmware_feature_count={int(model_feature_count)} "
+                        f"server_expected_feature_count={SUB_COUNT}"
+                    )
+                if isinstance(model_window_size, (int, float)) and int(model_window_size) != 16:
+                    print(
+                        "[CONFIG MISMATCH] "
+                        f"node={node_id} firmware_window_size={int(model_window_size)} expected=16"
+                    )
                 print(
                     "[MODEL READY] "
                     f"node={node_id} bytes={payload.get('bytes', '?')} "
-                    f"input_elements={payload.get('input_elements', '?')} window_size={payload.get('window_size', '?')}"
+                    f"input_elements={payload.get('input_elements', '?')} "
+                    f"window_size={payload.get('window_size', '?')} "
+                    f"feature_count={payload.get('feature_count', '?')} "
+                    f"feature_mode={payload.get('feature_mode', '?')}"
                 )
         return
 
@@ -391,8 +411,6 @@ def _finalize_session_artifacts(job: dict) -> None:
 
     print(f"FULL BATCH RECEIVED: Merging {total_sub_batches} parts for {esp32_id}/{room_state} session={sess}")
     existing_parts.sort()
-    full_df_list = [pd.read_csv(f) for f in existing_parts]
-    combined_df = pd.concat(full_df_list, ignore_index=True)
 
     manifest = _json_load(_session_manifest_path(session_dir), {})
 
@@ -403,7 +421,17 @@ def _finalize_session_artifacts(job: dict) -> None:
         room_state,
         f"csi_{room_state}_{split_group}_{timestamp}.csv",
     )
-    combined_df.to_csv(final_filename, index=False)
+    rows_written = 0
+    header_written = False
+    with open(final_filename, "w", encoding="utf-8", newline="") as out_fp:
+        for part_path in existing_parts:
+            # Chunked merge keeps memory stable while reducing write-call overhead.
+            # Default chunk size targets typical CSI dataset sizes and is tunable
+            # via FINALIZE_MERGE_CHUNK_SIZE for deployment-specific profiling.
+            for chunk in pd.read_csv(part_path, chunksize=FINALIZE_MERGE_CHUNK_SIZE):
+                rows_written += len(chunk)
+                chunk.to_csv(out_fp, index=False, header=not header_written)
+                header_written = True
 
     final_manifest_filename = _final_manifest_path(
         esp32_id,
@@ -418,7 +446,7 @@ def _finalize_session_artifacts(job: dict) -> None:
             "merged_at": datetime.now().isoformat(timespec='seconds'),
             "final_csv": final_filename,
             "final_manifest": final_manifest_filename,
-            "row_count": int(len(combined_df)),
+            "row_count": int(rows_written),
             "feature_count": int(SUB_COUNT),
             "sub_batch_count": int(total_sub_batches),
             "campaign_id": campaign_id,
@@ -462,7 +490,7 @@ def _finalize_session_artifacts(job: dict) -> None:
         if isinstance(info, dict) and info.get("session") == sess:
             active_sessions.pop(esp32_id, None)
 
-    print(f"SAVED: {final_filename} with {len(combined_df)} rows.")
+    print(f"SAVED: {final_filename} with {rows_written} rows.")
 
 
 def _node_model_dir(node_id: str) -> str:
@@ -716,25 +744,29 @@ def upload_data():
         with _active_sessions_lock:
             _seen_idempotency_keys[scoped_idem_key] = (time.time(), computed_crc)
 
-    # Periodically cleanup old incomplete session directories.
-    # This keeps the store from accumulating stale "in-progress" partial uploads.
-    _cleanup_old_session_dirs()
-
-    # Reshape binary data to DataFrame
+    # Reshape binary data to DataFrame with optimized construction
     csi_matrix = np.frombuffer(raw_data, dtype=np.uint8).reshape(SUB_BATCH_SIZE, SUB_COUNT)
-    df = pd.DataFrame(csi_matrix, columns=CSI_HEADERS)
-    df.insert(0, "row_in_sub_batch", np.arange(len(df), dtype=np.int32))
-    df.insert(0, "global_sample_idx", sub_batch_idx * SUB_BATCH_SIZE + df["row_in_sub_batch"].to_numpy(dtype=np.int32))
-    df.insert(0, "upload_received_at", received_at)
-    df.insert(0, "idempotency_key", idem_key or "")
-    df.insert(0, "payload_crc32", f"{computed_crc:08x}")
-    df.insert(0, "collection_split", split_group)
-    df.insert(0, "calibration_run_id", run_id)
-    df.insert(0, "campaign_id", campaign_id)
-    df.insert(0, "sub_batch_idx", sub_batch_idx)
-    df.insert(0, "session_id", sess)
-    df.insert(0, "collection_label", room_state)
-    df.insert(0, "node_id", esp32_id)
+    
+    # Build all columns at once (O(1) dict construction vs O(n) per insert)
+    row_count = len(csi_matrix)
+    metadata_columns = {
+        "node_id": [esp32_id] * row_count,
+        "collection_label": [room_state] * row_count,
+        "session_id": [sess] * row_count,
+        "sub_batch_idx": [sub_batch_idx] * row_count,
+        "campaign_id": [campaign_id] * row_count,
+        "calibration_run_id": [run_id] * row_count,
+        "collection_split": [split_group] * row_count,
+        "payload_crc32": [f"{computed_crc:08x}"] * row_count,
+        "idempotency_key": [idem_key or ""] * row_count,
+        "upload_received_at": [received_at] * row_count,
+        "global_sample_idx": sub_batch_idx * SUB_BATCH_SIZE + np.arange(row_count, dtype=np.int32),
+        "row_in_sub_batch": np.arange(row_count, dtype=np.int32),
+    }
+    
+    # Combine CSI data with metadata in single DataFrame construction
+    csi_df = pd.DataFrame(csi_matrix, columns=CSI_HEADERS)
+    df = pd.concat([pd.DataFrame(metadata_columns), csi_df], axis=1)
     
     # Path setup: Use a unique sub-directory for this session (handles multiple
     # collections from the same node/state running concurrently).
