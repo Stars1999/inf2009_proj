@@ -87,10 +87,10 @@ VIEW_FILE = "view_state.json"              # last page/node
 MODEL_FILE = "models.json"                 # per-node model validity flag
 HEARTBEAT_FILE = "heartbeat_state.json"    # per-node last heartbeat timestamps
 
-# Liveliness check configuration
-HEARTBEAT_TIMEOUT_S = 90            # Mark node stale if no heartbeat for 90s
-LIVELINESS_CHECK_INTERVAL_MS = 30000  # Run liveliness check every 30s
-STALE_ON_STARTUP_THRESHOLD_S = 300  # 5 minutes - mark offline if last heartbeat older
+# Liveliness check configuration - tuned for faster offline detection
+HEARTBEAT_TIMEOUT_S = 20             # Mark node stale if no heartbeat for 20s (matches ESP32 15s interval + margin)
+LIVELINESS_CHECK_INTERVAL_MS = 5000  # Run liveliness check every 5s (fast detection)
+STALE_ON_STARTUP_THRESHOLD_S = 300   # 5 minutes - mark offline if last heartbeat older
 
 
 if not os.path.exists(LOG_DIR):
@@ -331,6 +331,7 @@ class GovernanceApp(ctk.CTk):
 
         try:
             main_dash.refresh_active_view(force=False)
+            main_dash.update_idletasks()
         except Exception:
             pass
 
@@ -623,8 +624,21 @@ class GovernanceApp(ctk.CTk):
                     # If heartbeat is ancient, ensure node starts offline
                     if now - ts > STALE_ON_STARTUP_THRESHOLD_S:
                         self.node_online[node_id] = False
+                    else:
+                        # Recent heartbeat - tentatively mark online, will be confirmed by next heartbeat
+                        self.node_online[node_id] = True
         except Exception as e:
             print(f"WARNING: failed to load heartbeat state: {e}")
+
+    def _clear_node_heartbeat_state(self, node_id):
+        """Clear persisted heartbeat timestamp for one node and mark it offline."""
+        if node_id in self.node_last_heartbeat:
+            self.node_last_heartbeat[node_id] = 0.0
+        if node_id in self.node_online:
+            self.node_online[node_id] = False
+        if node_id in self.node_last_seen:
+            self.node_last_seen.pop(node_id, None)
+        self._save_heartbeat_state()
 
     def _save_heartbeat_state(self):
         """Persist heartbeat timestamps for recovery after restart."""
@@ -686,11 +700,13 @@ class GovernanceApp(ctk.CTk):
                     self._save_heartbeat_state()
                 print(f"\033[92m[SYSTEM] Node {node_id} is ONLINE\033[0m")
                 self._log("SYSTEM", f"Node {node_id} is ONLINE")
+                self._queue_ui_refresh()
             elif status_payload == "offline":
                 self.node_last_seen[node_id] = now_epoch
                 self.node_online[node_id] = False
                 print(f"\033[91m[ALERT] Node {node_id} is OFFLINE\033[0m")
                 self._log("ALERT", f"Node {node_id} is OFFLINE")
+                self._queue_ui_refresh()
 
         completion_node = None
         completion_state = None
@@ -705,10 +721,11 @@ class GovernanceApp(ctk.CTk):
                 evt = payload_json.get("event")
                 if evt == "node_online":
                     # Accept model status updates when the node first joins.
-                    # Update heartbeat timestamp - proof of life
+                    # Update heartbeat timestamp and mark online - proof of life
                     if node_id in self.node_last_heartbeat:
                         self.node_last_heartbeat[node_id] = now_epoch
                         self.node_last_seen[node_id] = now_epoch
+                        self.node_online[node_id] = True
                         self._save_heartbeat_state()
                     mr = payload_json.get("model_ready")
                     if isinstance(mr, bool):
@@ -716,10 +733,11 @@ class GovernanceApp(ctk.CTk):
                             self.model_state[node_id] = mr
                             self._save_model_state()
                 elif evt == "heartbeat":
-                    # Heartbeats are proof of life - update timestamp
+                    # Heartbeats are proof of life - update timestamp and mark online
                     if node_id in self.node_last_heartbeat:
                         self.node_last_heartbeat[node_id] = now_epoch
                         self.node_last_seen[node_id] = now_epoch
+                        self.node_online[node_id] = True
                         self._save_heartbeat_state()
                     # Heartbeats can also include model_ready to keep dashboard in sync.
                     mr = payload_json.get("model_ready")
@@ -1054,7 +1072,7 @@ class MainDashboard(ctk.CTkFrame):
                 cfg = self.sub_frames.get("ESP32-C3 Configuration")
                 if cfg:
                     cfg.refresh(force_table=False)
-            self._dataset_summary_cache.cleanup()
+            self.controller._dataset_summary_cache.cleanup()
         except Exception:
             pass
         self.after(2000, self._periodic_status_refresh)
@@ -1075,6 +1093,11 @@ class MainDashboard(ctk.CTkFrame):
                 frame.refresh()
         except TypeError:
             frame.refresh()
+        finally:
+            try:
+                frame.update_idletasks()
+            except Exception:
+                pass
 
     def switch_view(self, name):
         # logout gets special handling regardless of current view
@@ -1096,6 +1119,10 @@ class MainDashboard(ctk.CTkFrame):
                         self.sub_frames[name].refresh()
                 except Exception:
                     pass
+            try:
+                self.sub_frames[name].update_idletasks()
+            except Exception:
+                pass
 
         # remember state for persistence
         self.controller.last_view = name
@@ -1120,10 +1147,6 @@ class HomeView(ctk.CTkFrame):
         self.refresh()
 
     def refresh(self):
-        # Clear old stats
-        for widget in self.grid_container.winfo_children():
-            widget.destroy()
-
         # Calculate dynamic counts
         total_keys = len(self.controller.keys)
         issued_keys = sum(1 for status in self.controller.keys.values() if status == "out")
@@ -1145,6 +1168,10 @@ class HomeView(ctk.CTkFrame):
         if stats_signature == self._last_stats_signature:
             return
         self._last_stats_signature = stats_signature
+
+        # Clear old stats only when we know a redraw is needed.
+        for widget in self.grid_container.winfo_children():
+            widget.destroy()
 
         for i, (v, t) in enumerate(stats):
             box = ctk.CTkFrame(self.grid_container, width=180, height=130, 
@@ -2745,6 +2772,7 @@ class ESPConfigView(ctk.CTkFrame):
                 self.controller.expected_session.pop(node_id, None)
                 self.controller.auto_training_hold_logged[node_id] = False
                 self.controller._dataset_summary_cache.invalidate(node_id)
+                self.controller._clear_node_heartbeat_state(node_id)
                 self.controller._notify_model_reset(node_id)
                 self.controller._log('Action', f'Reset entire rack {node_id} (including model artifacts)')
             else:
