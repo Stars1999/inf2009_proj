@@ -79,7 +79,7 @@ PASO_INFERENCE_BUDGET_US = int(os.getenv("PASO_INFERENCE_BUDGET_US", "50000"))
 PASO_END_TO_END_BUDGET_US = int(os.getenv("PASO_END_TO_END_BUDGET_US", "500000"))
 PASO_ASYNC_FINALIZE_ENABLED = os.getenv("PASO_ASYNC_FINALIZE", "1").strip().lower() in ("1", "true", "yes")
 PASO_FINALIZE_QUEUE_SIZE = int(os.getenv("PASO_FINALIZE_QUEUE_SIZE", "32"))
-PERF_BIN_STRUCT = struct.Struct("<BBHIIIIIiiiiI")
+PERF_BIN_STRUCT = struct.Struct("<BBHIIIIIiiiiII")
 
 
 def _json_load(path: str, default):
@@ -218,6 +218,7 @@ def on_mqtt_message(client, userdata, message):
                 invoke_stage_us,
                 pipeline_total_us,
                 free_heap,
+                largest_block,  # <-- Added new field
             ) = PERF_BIN_STRUCT.unpack(raw)
         except struct.error as e:
             print(f"[PASO PERF] node={node_id} unpack error: {e}")
@@ -226,6 +227,7 @@ def on_mqtt_message(client, userdata, message):
         if version != 1:
             print(f"[PASO PERF] node={node_id} unsupported version={version}")
             return
+            
         if payload_size != PERF_BIN_STRUCT.size:
             print(f"[PASO PERF] node={node_id} payload_size mismatch header={payload_size} expected={PERF_BIN_STRUCT.size}")
 
@@ -233,7 +235,7 @@ def on_mqtt_message(client, userdata, message):
             "[PASO PERF] "
             f"node={node_id} invoke_us(last={invoke_last_us},avg={invoke_avg_us},min={invoke_min_us},max={invoke_max_us},n={sample_count}) "
             f"stage_us(wait={queue_wait_us},feature={feature_us},invoke={invoke_stage_us},total={pipeline_total_us}) "
-            f"free_heap={free_heap}"
+            f"free_heap={free_heap} largest_block={largest_block}" # <-- Added to log
         )
 
         if invoke_avg_us > PASO_INFERENCE_BUDGET_US:
