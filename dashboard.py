@@ -451,8 +451,8 @@ class AppState:
                 "sessions": 0,
                 "rows_raw": 0,
                 "rows_clean": 0,
-                "split_files": {"train": 0, "dev": 0, "test": 0},
-                "split_rows": {"train": 0, "dev": 0, "test": 0},
+                "split_files": {"train": 0, "dev": 0},
+                "split_rows": {"train": 0, "dev": 0},
             }
             if not os.path.isdir(state_dir):
                 continue
@@ -890,7 +890,7 @@ class ESPConfigPage(QWidget):
         controls_layout.addWidget(self.label_selector)
 
         self.split_selector = QComboBox()
-        self.split_selector.addItems(["train", "dev", "test"])
+        self.split_selector.addItems(["train", "dev"])
         controls_layout.addWidget(QLabel("Split:"))
         controls_layout.addWidget(self.split_selector)
 
@@ -957,7 +957,40 @@ class ESPConfigPage(QWidget):
         if not node:
             return
         status = "online" if self.state.node_online.get(node) else "offline"
-        self.status_label.setText(f"Node: {node} | Status: {status.upper()} | Current State: {self.state.node_detected_state.get(node, 'unknown')}")
+
+        # Check for model artifacts on disk
+        node_model_dir = os.path.join(MODEL_STORE_DIR, node)
+        model_path = os.path.join(node_model_dir, "model.tflite")
+        scaler_path = os.path.join(node_model_dir, "scaler_params.json")
+        model_exists = os.path.isfile(model_path)
+
+        prev_model_state = self.state.model_state.get(node, False)
+        self.state.model_state[node] = bool(model_exists)
+        if prev_model_state != self.state.model_state[node]:
+            try:
+                self.state.persist()
+            except Exception:
+                pass
+
+        # Compose model status text
+        if model_exists:
+            try:
+                size = os.path.getsize(model_path)
+                mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(model_path)))
+                scaler_present = os.path.isfile(scaler_path)
+                model_text = f"Model: model.tflite ({size} bytes) | Scaler: {'present' if scaler_present else 'missing'} | Built: {mtime}"
+            except Exception:
+                model_text = "Model: model.tflite (unknown)"
+        else:
+            model_text = "No model loaded"
+
+        self.status_label.setText(f"Node: {node} | Status: {status.upper()} | Current State: {self.state.node_detected_state.get(node, 'unknown')} | {model_text}")
+
+        # Enable/disable training and load buttons appropriately
+        can_train = all(self.state.esp_nodes.get(node, {}).get(s, False) for s in CALIB_STATES) and not self.state.training_in_progress.get(node, False)
+        self.training_button.setEnabled(bool(can_train))
+        if hasattr(self, "load_button"):
+            self.load_button.setEnabled(bool(model_exists))
 
         self.detail_table.setRowCount(len(CALIB_STATES))
         summary = self.state.build_dataset_summary(node)
@@ -1116,6 +1149,14 @@ class ESPConfigPage(QWidget):
             self.status_label.setText("Model trained" if success else "Training failed")
         self.training_button.setEnabled(True)
         self.parent.log_message(msg)
+        # Show a user-friendly popup when training fails to make the issue visible to the user
+        if not success:
+            display_msg = msg or "Training failed. See logs for details."
+            try:
+                QMessageBox.warning(self, "Training Failed", display_msg)
+            except Exception:
+                # If GUI popup fails for any reason, ensure message is still logged
+                self.parent.log_message(f"Failed to show popup: {display_msg}")
 
     def reset_calibrations(self):
         node = self.node_selector.currentText()
