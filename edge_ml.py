@@ -11,7 +11,9 @@ import glob
 import importlib
 import json
 import os
+import sys
 import traceback
+import sys
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -190,10 +192,24 @@ def _load_dataset(data_dir: str, node: str) -> Tuple[pd.DataFrame, pd.DataFrame,
     df_close = _load_state_df(data_dir, node, "door_closed")
     df_person = _load_state_df(data_dir, node, "person_standing")
 
-    if df_open.empty or df_close.empty or df_person.empty:
-        raise RuntimeError(
-            "Training requires all 3 classes with data: door_open, door_closed, person_standing"
+    missing: List[str] = []
+    if df_open.empty:
+        missing.append("door_open")
+    if df_close.empty:
+        missing.append("door_closed")
+    if df_person.empty:
+        missing.append("person_standing")
+
+    if missing:
+        msg = (
+            "Training requires all 3 classes with data. "
+            f"Missing classes for node '{node}': {', '.join(missing)}. "
+            "Collect calibration data for the missing states and try again."
         )
+        # Print a clear, user-friendly error to stderr so callers capture it
+        print(f"[ERROR] {msg}", file=sys.stderr)
+        # Exit gracefully with a distinct status code so callers (UI) can handle it without a traceback
+        raise SystemExit(2)
 
     return df_open, df_close, df_person
 
@@ -352,7 +368,7 @@ def main() -> int:
         )
         y = df_combined["label"].to_numpy(dtype=np.int32)
 
-        x_train_raw, x_test_raw, y_train, y_test = train_test_split(
+        x_train_raw, x_dev_raw, y_train, y_dev = train_test_split(
             x,
             y,
             test_size=float(args.test_size),
@@ -362,17 +378,17 @@ def main() -> int:
 
         scaler = StandardScaler()
         x_train = scaler.fit_transform(x_train_raw)
-        x_test = scaler.transform(x_test_raw)
+        x_dev = scaler.transform(x_dev_raw)
 
         print(f"[INFO] Training set shape: {x_train.shape}")
-        print(f"[INFO] Testing set shape: {x_test.shape}")
+        print(f"[INFO] Dev set shape: {x_dev.shape}")
 
         model = build_model(tf, x_train.shape[1])
         print("[INFO] Starting baseline model training...")
         model.fit(
             x_train,
             y_train,
-            validation_data=(x_test, y_test),
+            validation_data=(x_dev, y_dev),
             epochs=int(args.epochs),
             batch_size=int(args.batch_size),
             verbose=0,
@@ -384,8 +400,8 @@ def main() -> int:
             ],
         )
 
-        baseline_loss, baseline_acc = model.evaluate(x_test, y_test, verbose=0)
-        print(f"[INFO] Baseline test loss={baseline_loss:.5f}, acc={baseline_acc:.5f}")
+        baseline_loss, baseline_acc = model.evaluate(x_dev, y_dev, verbose=0)
+        print(f"[INFO] Baseline dev loss={baseline_loss:.5f}, acc={baseline_acc:.5f}")
 
         final_model = model
         final_loss = baseline_loss
@@ -444,7 +460,7 @@ def main() -> int:
                 pruned_model.fit(
                     x_train,
                     y_train,
-                    validation_data=(x_test, y_test),
+                    validation_data=(x_dev, y_dev),
                     epochs=pruning_epochs,
                     batch_size=int(args.batch_size),
                     verbose=0,
@@ -464,10 +480,10 @@ def main() -> int:
                     metrics=["accuracy"],
                 )
 
-                prune_loss, prune_acc = stripped_model.evaluate(x_test, y_test, verbose=0)
+                prune_loss, prune_acc = stripped_model.evaluate(x_dev, y_dev, verbose=0)
                 drop = float(baseline_acc - prune_acc)
                 print(
-                    f"[INFO] Pruned test loss={prune_loss:.5f}, acc={prune_acc:.5f}, acc_drop={drop:.5f}"
+                    f"[INFO] Pruned dev loss={prune_loss:.5f}, acc={prune_acc:.5f}, acc_drop={drop:.5f}"
                 )
 
                 if drop > float(args.max_accuracy_drop):
@@ -489,13 +505,13 @@ def main() -> int:
                     }
                 )
 
-        y_pred_probs = final_model.predict(x_test, verbose=0)
+        y_pred_probs = final_model.predict(x_dev, verbose=0)
         y_pred = np.argmax(y_pred_probs, axis=1)
-        cm = confusion_matrix(y_test, y_pred)
+        cm = confusion_matrix(y_dev, y_pred)
         print("[INFO] Confusion Matrix:")
         print(cm)
         print("[INFO] Classification Report:")
-        print(classification_report(y_test, y_pred, target_names=["open", "close", "person"], zero_division=0))
+        print(classification_report(y_dev, y_pred, target_names=["open", "close", "person"], zero_division=0))
 
         print(f"[INFO] Final model loss={final_loss:.5f}, acc={final_acc:.5f}")
 

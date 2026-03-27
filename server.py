@@ -52,7 +52,19 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 # match firmware definition: ACTIVE_SUBCARRIERS = (MAX_UPPER - MAX_LOWER) with DC excluded
 SUB_COUNT = len(CSI_HEADERS)
 ALLOWED_LABELS = {"door_closed", "door_open", "person_standing"}
-ALLOWED_SPLITS = {"train", "dev", "test"}
+ALLOWED_SPLITS = {"train", "dev"}
+
+
+def _normalize_split(split_group: str | None) -> str:
+    """Normalize incoming split identifiers. Preserve backward compatibility by mapping 'test' to 'dev'."""
+    if not isinstance(split_group, str):
+        return "train"
+    s = split_group.strip().lower()
+    if s == "test":
+        return "dev"
+    if s in ALLOWED_SPLITS:
+        return s
+    return "train"
 active_sessions = {}
 # The idempotency cache is used to detect retries of the same logical upload.
 # It grows with every new (session, sub-batch) combination until the cleanup
@@ -341,8 +353,7 @@ def on_mqtt_message(client, userdata, message):
             run_id = sess
         if campaign_id is None or not isinstance(campaign_id, str) or not campaign_id:
             campaign_id = sess
-        if split_group not in ALLOWED_SPLITS:
-            split_group = "train"
+                split_group = _normalize_split(split_group)
         with _active_sessions_lock:
             active_sessions[node_id] = {
                 "label": label,
@@ -679,8 +690,7 @@ def upload_data():
         campaign_id = info.get('campaign_id')
     if not split_group and isinstance(info, dict):
         split_group = info.get('split_group')
-    if split_group not in ALLOWED_SPLITS:
-        split_group = 'train'
+    split_group = _normalize_split(split_group)
     if not campaign_id or not isinstance(campaign_id, str):
         campaign_id = sess
     campaign_slug = _safe_slug(campaign_id, fallback=sess)

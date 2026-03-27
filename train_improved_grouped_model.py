@@ -148,17 +148,17 @@ def main():
     
     print(f"[INFO] Feature dimensions: {x.shape} (8 groups + 1 temporal = 9 features)")
     
-    # Split data (stratified)
-    x_train, x_test, y_train, y_test = train_test_split(
+    # Split data (stratified) -> use 'dev' instead of 'test' (backwards-compatible)
+    x_train, x_dev, y_train, y_dev = train_test_split(
         x, y, test_size=0.2, random_state=42, stratify=y
     )
     
     # Normalize
     scaler = StandardScaler()
     x_train = scaler.fit_transform(x_train)
-    x_test = scaler.transform(x_test)
+    x_dev = scaler.transform(x_dev)
     
-    print(f"[INFO] Training set: {x_train.shape}, Test set: {x_test.shape}")
+    print(f"[INFO] Training set: {x_train.shape}, Dev set: {x_dev.shape}")
     
     # Class weights to handle imbalance
     class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
@@ -177,21 +177,21 @@ def main():
     )
     model.fit(x_train, y_train)
     
-    # Evaluate
-    y_pred = model.predict(x_test)
-    accuracy = np.mean(y_pred == y_test)
+    # Evaluate on dev set
+    y_pred = model.predict(x_dev)
+    accuracy = np.mean(y_pred == y_dev)
     print(f"\n[INFO] Accuracy: {accuracy:.4f}")
     print("\n[INFO] Classification Report:")
-    print(classification_report(y_test, y_pred, target_names=TARGET_NAMES))
+    print(classification_report(y_dev, y_pred, target_names=TARGET_NAMES))
     
     # Per-class F1
-    f1_scores = f1_score(y_test, y_pred, average=None)
-    macro_f1 = f1_score(y_test, y_pred, average='macro')
+    f1_scores = f1_score(y_dev, y_pred, average=None)
+    macro_f1 = f1_score(y_dev, y_pred, average='macro')
     print(f"\n[INFO] Per-class F1 scores: {dict(zip(TARGET_NAMES, f1_scores))}")
     print(f"[INFO] Macro F1: {macro_f1:.4f}")
     
     # Confusion matrix
-    cm = confusion_matrix(y_test, y_pred)
+    cm = confusion_matrix(y_dev, y_pred)
     print(f"\n[INFO] Confusion Matrix:\n{cm}")
     
     # Save model metadata (ESP32 compatible format)
@@ -228,7 +228,7 @@ def main():
             "model_type": "RandomForest",
             "total_samples": len(df_combined),
             "train_samples": len(x_train),
-            "test_samples": len(x_test),
+            "dev_samples": len(x_dev),
             "n_classes": 3,
             "class_weights": class_weight_dict,
             "accuracy": float(accuracy),
