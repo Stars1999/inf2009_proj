@@ -477,7 +477,10 @@ class AppState:
                     split_group = str(df["split_group"].mode().iloc[0]).lower() if not df["split_group"].mode().empty else "train"
                 elif "dataset_split" in df.columns:
                     split_group = str(df["dataset_split"].mode().iloc[0]).lower() if not df["dataset_split"].mode().empty else "train"
-                if split_group not in ("train", "dev", "test"):
+                # Map legacy 'test' -> 'dev' and default unknown splits to 'train'
+                if split_group == "test":
+                    split_group = "dev"
+                if split_group not in ("train", "dev"):
                     split_group = "train"
                 label_summary["split_files"][split_group] += 1
                 label_summary["split_rows"][split_group] += rows
@@ -941,8 +944,8 @@ class ESPConfigPage(QWidget):
         table_label.setStyleSheet("font-weight: bold; font-size: 16px; margin-top: 10px;")
         layout.addWidget(table_label)
 
-        self.detail_table = QTableWidget(0, 5)
-        self.detail_table.setHorizontalHeaderLabels(["State", "Trained?", "Train Rows", "Dev Rows", "Test Rows"])
+        self.detail_table = QTableWidget(0, 4)
+        self.detail_table.setHorizontalHeaderLabels(["State", "Trained?", "Train Rows", "Dev Rows"])
         # Make columns equal width and rows uniform
         self.detail_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.detail_table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
@@ -1007,7 +1010,6 @@ class ESPConfigPage(QWidget):
             splits = info.get("split_rows", {}) if isinstance(info, dict) else {}
             self.detail_table.setItem(i, 2, QTableWidgetItem(str(splits.get("train", 0))))
             self.detail_table.setItem(i, 3, QTableWidgetItem(str(splits.get("dev", 0))))
-            self.detail_table.setItem(i, 4, QTableWidgetItem(str(splits.get("test", 0))))
 
     def count_state_rows(self, node, state, base):
         path = os.path.join(base, node, state)
@@ -1360,7 +1362,7 @@ class GraphsPage(QWidget):
         lines = [f"Node: {node}", f"Generated: {summary.get('generated_at')}", f"Total files: {summary.get('total_files')}", f"Total rows: {summary.get('total_rows')}", ""]
         for label, info in summary.get("labels", {}).items():
             lines.append(f"{label}: files={info.get('files')} sessions={info.get('sessions')} rows={info.get('rows_clean')}")
-            lines.append(f"  splits -> train={info['split_rows'].get('train',0)} dev={info['split_rows'].get('dev',0)} test={info['split_rows'].get('test',0)}")
+            lines.append(f"  splits -> train={info['split_rows'].get('train',0)} dev={info['split_rows'].get('dev',0)}")
         self.summary_text.setPlainText("\n".join(lines))
 
     def plot_summary(self):
