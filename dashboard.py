@@ -1124,6 +1124,26 @@ class ESPConfigPage(QWidget):
                 success = True
 
             if success:
+                # Attempt to push the trained artifacts (model + scaler) to the server node directory
+                try:
+                    import push_model as _push_model
+                except Exception:
+                    _push_model = None
+
+                try:
+                    if _push_model is not None:
+                        # model_output and scaler_output should be paths inside MODEL_STORE_DIR by convention
+                        if os.path.isfile(model_output):
+                            _push_model.push_model_file(model_output, node)
+                        if os.path.isfile(scaler_output):
+                            _push_model.push_scaler_params(scaler_output, node)
+                        try:
+                            _push_model.trigger_model_load_mqtt(node)
+                        except Exception as e:
+                            self.parent.log_message(f"Failed to trigger device load via push_model: {e}")
+                except Exception as e:
+                    self.parent.log_message(f"push_model transfer failed: {e}")
+
                 self.state.model_state[node] = True
                 self.state.persist()
                 self._notify_training_complete(node)
@@ -1175,38 +1195,52 @@ class ESPConfigPage(QWidget):
         
         if reply != QMessageBox.Yes:
             return
-        
+
         try:
-            # Clear calibration flags
+            # Update in-memory state immediately and persist so UI reflects reset
             for state in CALIB_STATES:
                 self.state.esp_nodes[node][state] = False
-            
-            # Delete CSI data for the node
-            node_dir = os.path.join(self.state.config.get("csi_data_dir", CSI_DATA_DIR), node)
-            if os.path.isdir(node_dir):
-                shutil.rmtree(node_dir)
-            
-            # Delete server-side model artifacts for the node (tflite + scaler)
-            node_model_dir = os.path.join(MODEL_STORE_DIR, node)
-            if os.path.isdir(node_model_dir):
-                # remove known artifacts if present
+
+            self.state.collection_campaign.pop(node, None)
+            self.state.collection_run_counter.pop(node, None)
+            self.state.expected_calib.pop(node, None)
+            self.state.expected_session.pop(node, None)
+            self.state.model_state[node] = False
+            self.state.training_in_progress[node] = False
+            self.state.node_last_heartbeat[node] = 0.0
+
+            self.state.persist()
+
+            # Run filesystem deletion + MQTT trigger in background to avoid UI freeze
+            def _bg_reset():
                 try:
-                    tflite_path = os.path.join(node_model_dir, "model.tflite")
-                    if os.path.exists(tflite_path):
-                        os.remove(tflite_path)
-                except Exception:
-                    pass
-                try:
-                    scaler_path = os.path.join(node_model_dir, "scaler_params.json")
-                    if os.path.exists(scaler_path):
-                        os.remove(scaler_path)
-                except Exception:
-                    pass
-                # remove any remaining artifacts/directory
-                try:
-                    shutil.rmtree(node_model_dir)
-                except Exception:
-                    pass
+                    import reset_helpers as _reset_helpers
+                    csi_root = self.state.config.get("csi_data_dir", CSI_DATA_DIR)
+                    ok = _reset_helpers.reset_node(node, csi_root=csi_root, model_root=MODEL_STORE_DIR, trigger_mqtt=True)
+                    if ok:
+                        self.parent.log_message(f"Reset calibrations for {node} (background)")
+                    else:
+                        self.parent.log_message(f"Reset calibrations for {node} (background: partial failures)")
+                except Exception as e:
+                    self.parent.log_message(f"Background reset failed: {e}")
+
+            threading.Thread(target=_bg_reset, daemon=True).start()
+
+            # Update UI immediately to reflect reset
+            try:
+                self.status_label.setText("Status: No model loaded")
+                # make it stand out as cleared
+                self.status_label.setStyleSheet("font-weight: bold; color: #d32f2f; margin-top: 10px; font-size: 15px;")
+                self.train_progress.setValue(0)
+                self.training_button.setEnabled(False)
+            except Exception:
+                pass
+
+            self.parent.log_message(f"Reset calibrations initiated for {node}")
+            self.refresh()
+        except Exception as e:
+            self.parent.log_message(f"Failed to reset {node}: {e}")
+
             
             # Clear transient state
             self.state.collection_campaign.pop(node, None)
