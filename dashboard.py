@@ -924,6 +924,11 @@ class ESPConfigPage(QWidget):
         self.training_button.clicked.connect(self.train_model)
         actions_layout.addWidget(self.training_button)
 
+        self.load_button = QPushButton("Load Model")
+        self.load_button.setObjectName("ActionBtn")
+        self.load_button.clicked.connect(self.load_model)
+        actions_layout.addWidget(self.load_button)
+
         self.reset_button = QPushButton("Reset Calibrations")
         self.reset_button.setObjectName("DangerBtn")
         self.reset_button.clicked.connect(self.reset_calibrations)
@@ -1049,6 +1054,8 @@ class ESPConfigPage(QWidget):
             QMessageBox.information(self, "Training Not Ready", "Complete all calibration states first.")
             return
 
+        self.state.training_in_progress[node] = True
+        self.state.persist()
         self.training_button.setEnabled(False)
         self.status_label.setText("Training in progress...")
         self.train_progress.setRange(0, 0)
@@ -1094,6 +1101,11 @@ class ESPConfigPage(QWidget):
         except Exception as e:
             msg = f"Training exception: {e}"
         finally:
+            try:
+                self.state.training_in_progress[node] = False
+                self.state.persist()
+            except Exception:
+                pass
             self.parent.signals.training_result.emit(node, success, msg)
             self.parent.signals.error.emit(msg)
 
@@ -1122,17 +1134,38 @@ class ESPConfigPage(QWidget):
             return
         
         try:
+            # Clear calibration flags
             for state in CALIB_STATES:
                 self.state.esp_nodes[node][state] = False
             
+            # Delete CSI data for the node
             node_dir = os.path.join(self.state.config.get("csi_data_dir", CSI_DATA_DIR), node)
             if os.path.isdir(node_dir):
                 shutil.rmtree(node_dir)
             
+            # Delete server-side model artifacts for the node (tflite + scaler)
             node_model_dir = os.path.join(MODEL_STORE_DIR, node)
             if os.path.isdir(node_model_dir):
-                shutil.rmtree(node_model_dir)
+                # remove known artifacts if present
+                try:
+                    tflite_path = os.path.join(node_model_dir, "model.tflite")
+                    if os.path.exists(tflite_path):
+                        os.remove(tflite_path)
+                except Exception:
+                    pass
+                try:
+                    scaler_path = os.path.join(node_model_dir, "scaler_params.json")
+                    if os.path.exists(scaler_path):
+                        os.remove(scaler_path)
+                except Exception:
+                    pass
+                # remove any remaining artifacts/directory
+                try:
+                    shutil.rmtree(node_model_dir)
+                except Exception:
+                    pass
             
+            # Clear transient state
             self.state.collection_campaign.pop(node, None)
             self.state.collection_run_counter.pop(node, None)
             self.state.expected_calib.pop(node, None)
@@ -1141,7 +1174,51 @@ class ESPConfigPage(QWidget):
             self.state.training_in_progress[node] = False
             self.state.node_last_heartbeat[node] = 0.0
             
+            # Persist state
             self.state.persist()
+
+            # Trigger the ESP32 to reload model state so it drops any local model.
+            # Prefer the existing utility if available, fall back to publishing on the
+            # dashboard MQTT client if needed. Run in background to avoid UI freeze.
+            def _trigger_model_reload():
+                ok = False
+                try:
+                    # Try using push_model helper if present
+                    try:
+                        import push_model as _push_model
+                        ok = _push_model.trigger_model_load_mqtt(node)
+                    except Exception as e:
+                        self.parent.log_message(f"push_model helper unavailable or failed: {e}")
+
+                    if not ok:
+                        # Fallback: publish to /commands/<node>/load_model using existing client
+                        try:
+                            topic = f"/commands/{node}/load_model"
+                            if hasattr(self.parent, "mqtt") and getattr(self.parent.mqtt, "client", None):
+                                info = self.parent.mqtt.client.publish(topic, "", qos=1)
+                                if getattr(info, "rc", None) == mqtt.MQTT_ERR_SUCCESS:
+                                    self.parent.log_message(f"Triggered model load for {node} (fallback)")
+                                else:
+                                    self.parent.log_message(f"Fallback publish returned rc={getattr(info, 'rc', 'unknown')}")
+                            else:
+                                self.parent.log_message("No MQTT client available to trigger model reload")
+                        except Exception as e:
+                            self.parent.log_message(f"Fallback MQTT publish failed: {e}")
+                except Exception as e:
+                    self.parent.log_message(f"Model reload trigger failed: {e}")
+
+            threading.Thread(target=_trigger_model_reload, daemon=True).start()
+
+            # Update UI immediately to reflect reset
+            try:
+                self.status_label.setText("Status: No model loaded")
+                # make it stand out as cleared
+                self.status_label.setStyleSheet("font-weight: bold; color: #d32f2f; margin-top: 10px; font-size: 15px;")
+                self.train_progress.setValue(0)
+                self.training_button.setEnabled(False)
+            except Exception:
+                pass
+
             self.parent.log_message(f"Reset calibrations for {node}")
             self.refresh()
         except Exception as e:
@@ -1151,6 +1228,27 @@ class ESPConfigPage(QWidget):
         topic = f"/commands/{node}/training_complete"
         payload = json.dumps({"session": str(int(time.time()))})
         self.parent.mqtt.client.publish(topic, payload, qos=1)
+
+    def load_model(self):
+        node = self.node_selector.currentText()
+        if not node:
+            return
+        node_model_dir = os.path.join(MODEL_STORE_DIR, node)
+        model_path = os.path.join(node_model_dir, "model.tflite")
+        if not os.path.isfile(model_path):
+            QMessageBox.information(self, "No Model", f"No model file found for {node}")
+            return
+        try:
+            topic = f"/commands/{node}/load_model"
+            info = self.parent.mqtt.client.publish(topic, "", qos=1)
+            success_rc = getattr(info, "rc", None)
+            if success_rc == mqtt.MQTT_ERR_SUCCESS or success_rc == 0:
+                self.status_label.setText("Triggered model load on device")
+                self.parent.log_message(f"Triggered model load for {node}")
+            else:
+                self.parent.log_message(f"Failed to trigger model load for {node}: rc={success_rc}")
+        except Exception as e:
+            self.parent.log_message(f"Exception triggering model load: {e}")
 
     def set_progress(self, node, cur, total):
         if self.node_selector.currentText() != node:
