@@ -6,6 +6,8 @@ import time
 import threading
 import traceback
 import subprocess
+import queue
+import shutil
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
@@ -25,6 +27,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QTableWidget,
     QTableWidgetItem,
+    QHeaderView,
     QFileDialog,
     QProgressBar,
     QFormLayout,
@@ -221,7 +224,9 @@ QLabel.StatLabel {
 
 class DashboardSignals(QObject):
     node_status = Signal(str, str)  # node_id, status
+    key_status = Signal(str, str)  # key_id, status
     collection_progress = Signal(str, int, int)
+    collection_complete = Signal(str, str, str)  # node_id, label, session
     model_event = Signal(str, dict)
     training_result = Signal(str, bool, str)
     error = Signal(str)
@@ -232,11 +237,18 @@ class MqttClient(threading.Thread):
         super().__init__(daemon=True)
         self.state = state
         self.signals = signals
-        self.client = mqtt.Client(client_id="DashboardClient")
+        self.event_queue = queue.Queue()
+        self.client = mqtt.Client(
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+            client_id="DashboardClient",
+        )
         self.client.on_connect = self.on_connect
         self.client.on_disconnect = self.on_disconnect
         self.client.on_message = self.on_message
         self._stop = threading.Event()
+
+    def _enqueue_event(self, event_type, *args):
+        self.event_queue.put((event_type, *args))
 
     def run(self):
         host = self.state.config.get("broker", DEFAULT_MQTT_BROKER)
@@ -247,7 +259,7 @@ class MqttClient(threading.Thread):
             while not self._stop.is_set():
                 time.sleep(0.3)
         except Exception as e:
-            self.signals.error.emit(f"MQTT start failed: {e}")
+            self._enqueue_event("error", f"MQTT start failed: {e}")
 
     def stop(self):
         self._stop.set()
@@ -257,29 +269,31 @@ class MqttClient(threading.Thread):
         except Exception:
             pass
 
-    def on_connect(self, client, userdata, flags, rc, properties=None):
-        if rc == 0:
-            topics = [("device/+/status", 1), ("/sensors/+/status", 1)]
-            for topic, qos in topics:
-                client.subscribe(topic, qos=qos)
-            self.signals.error.emit("MQTT connected")
+    def on_connect(self, client, userdata, connect_flags, reason_code, properties=None):
+        if reason_code == 0:
+            client.subscribe("#", qos=1)
+            client.subscribe("device/+/status", qos=1)
+            client.subscribe("/sensors/+/status", qos=1)
+            self._enqueue_event("error", "MQTT connected")
         else:
-            self.signals.error.emit(f"MQTT connect fail {rc}")
+            self._enqueue_event("error", f"MQTT connect fail {reason_code}")
 
-    def on_disconnect(self, client, userdata, rc):
-        self.signals.error.emit("MQTT disconnected")
+    def on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties=None):
+        self._enqueue_event("error", "MQTT disconnected")
 
     def on_message(self, client, userdata, msg):
         try:
             topic = msg.topic
-            payload = msg.payload.decode(errors="ignore")
+            payload = msg.payload.decode(errors="ignore").strip()
+            
             if topic.startswith("device/") and topic.endswith("/status"):
                 node_id = topic.split("/")[1]
-                status = payload.strip().lower()
+                status = payload.lower()
                 self.state.node_online[node_id] = (status == "online")
                 if status == "online":
                     self.state.node_last_heartbeat[node_id] = time.time()
-                self.signals.node_status.emit(node_id, status)
+                self._enqueue_event("node_status", node_id, status)
+            
             elif topic.startswith("/sensors/") and topic.endswith("/status"):
                 node_id = topic.split("/")[2]
                 try:
@@ -292,19 +306,50 @@ class MqttClient(threading.Thread):
                 if event == "collection_progress":
                     sub = int(body.get("sub_batch_idx", 0))
                     total = int(body.get("total_sub_batches", 1))
-                    self.signals.collection_progress.emit(node_id, sub, total)
+                    self._enqueue_event("collection_progress", node_id, sub, total)
+                elif event == "upload":
+                    sub = body.get("sub")
+                    total = body.get("total")
+                    if isinstance(sub, (int, float)) and isinstance(total, (int, float)):
+                        self._enqueue_event("collection_progress", node_id, int(sub), int(total))
+                elif event == "collection_complete":
+                    label = body.get("label")
+                    session = body.get("session")
+                    if label in CALIB_STATES:
+                        self.state.esp_nodes[node_id][label] = True
+                        self._enqueue_event("collection_complete", node_id, label, session)
                 elif event == "model_ready":
                     self.state.model_state[node_id] = True
-                    self.signals.model_event.emit(node_id, body)
+                    self._enqueue_event("model_event", node_id, body)
                 elif event == "model_download_failed" or event == "model_download_incompatible":
                     self.state.model_state[node_id] = False
-                    self.signals.model_event.emit(node_id, body)
+                    self._enqueue_event("model_event", node_id, body)
+                elif event == "model_cleared":
+                    self.state.model_state[node_id] = False
+                    self._enqueue_event("model_event", node_id, body)
                 elif event == "heartbeat":
                     self.state.node_last_heartbeat[node_id] = time.time()
                 elif event == "state_change":
-                    self.state.node_detected_state[node_id] = body.get("state", "")
+                    state = body.get("state")
+                    if isinstance(state, str):
+                        self.state.node_detected_state[node_id] = state
+                elif event == "ack":
+                    cmd = body.get("cmd", "?")
+                    self._enqueue_event("error", f"{node_id} acknowledged {cmd}")
+                elif event == "identify_confirmed":
+                    assigned = body.get("name", node_id)
+                    self._enqueue_event("error", f"{node_id} confirmed name {assigned}")
+            
+            # Color Toggle Logic - matches legacy exactly
+            if payload in self.state.keys:
+                if topic == "Key Unlocked":
+                    self.state.keys[payload] = "out"
+                    self._enqueue_event("key_status", payload, "out")
+                elif topic == "Key Returned":
+                    self.state.keys[payload] = "in"
+                    self._enqueue_event("key_status", payload, "in")
         except Exception as e:
-            self.signals.error.emit(f"MQTT message handling error: {e}")
+            self._enqueue_event("error", f"MQTT message handling error: {e}")
 
 
 class AppState:
@@ -375,6 +420,16 @@ class AppState:
     def node_data_dir(self, node):
         base = self.config.get("csi_data_dir", CSI_DATA_DIR)
         return os.path.join(base, node)
+
+    def count_state_csv_files(self, node, state):
+        """Count CSV files recursively under csi_data/<node>/<state>, excluding files starting with 'part_'."""
+        node_dir = self.node_data_dir(node)
+        state_dir = os.path.join(node_dir, state)
+        if not os.path.isdir(state_dir):
+            return 0
+        csv_paths = sorted(glob.glob(os.path.join(state_dir, "**", "*.csv"), recursive=True))
+        files = [p for p in csv_paths if not os.path.basename(p).startswith("part_")]
+        return len(files)
 
     def build_dataset_summary(self, node):
         node_dir = self.node_data_dir(node)
@@ -447,7 +502,9 @@ class DashboardMain(QMainWindow):
         self.mqtt = MqttClient(self.state, self.signals)
 
         self.signals.node_status.connect(self.on_node_status)
+        self.signals.key_status.connect(self.on_key_status)
         self.signals.collection_progress.connect(self.on_collection_progress)
+        self.signals.collection_complete.connect(self.on_collection_complete)
         self.signals.model_event.connect(self.on_model_event)
         self.signals.training_result.connect(lambda node, success, msg: self.pages["ESP32-C3 Configuration"].on_training_result(node, success, msg))
         self.signals.error.connect(self.log_message)
@@ -533,7 +590,28 @@ class DashboardMain(QMainWindow):
         idx = list(self.pages.keys()).index(name)
         self.stack.setCurrentIndex(idx)
 
+    def process_mqtt_events(self):
+        while True:
+            try:
+                event = self.mqtt.event_queue.get_nowait()
+            except queue.Empty:
+                break
+            kind = event[0]
+            if kind == "error":
+                self.signals.error.emit(event[1])
+            elif kind == "node_status":
+                self.signals.node_status.emit(event[1], event[2])
+            elif kind == "key_status":
+                self.signals.key_status.emit(event[1], event[2])
+            elif kind == "collection_progress":
+                self.signals.collection_progress.emit(event[1], event[2], event[3])
+            elif kind == "collection_complete":
+                self.signals.collection_complete.emit(event[1], event[2], event[3])
+            elif kind == "model_event":
+                self.signals.model_event.emit(event[1], event[2])
+
     def periodic_refresh(self):
+        self.process_mqtt_events()
         if self.state.node_online:
             for node_id, last in self.state.node_last_heartbeat.items():
                 if not last:
@@ -557,8 +635,27 @@ class DashboardMain(QMainWindow):
             self.pages["Homepage"].refresh()
             self.pages["Key Management"].refresh()
 
+    def on_key_status(self, key_name, status):
+        self.log_message(f"{key_name} status changed to {status}")
+        self.state.keys[key_name] = status
+        self.state.persist()
+        if self.stack.currentWidget() == self.pages["Key Management"]:
+            self.pages["Key Management"].refresh()
+        self.pages["Homepage"].refresh()
+
     def on_collection_progress(self, node_id, cur, total):
-        self.pages["ESP32-C3 Configuration"].set_progress(node_id, cur, total)
+        page = self.pages["ESP32-C3 Configuration"]
+        page.set_progress(node_id, cur, total)
+        # Refresh counts/display if the page is visible
+        if self.stack.currentWidget() == page:
+            page.refresh()
+    
+    def on_collection_complete(self, node_id, label, session):
+        self.log_message(f"Collection complete: {node_id}/{label} session={session}")
+        self.state.esp_nodes[node_id][label] = True
+        self.state.persist()
+        if self.stack.currentWidget() == self.pages["ESP32-C3 Configuration"]:
+            self.pages["ESP32-C3 Configuration"].refresh()
 
     def on_model_event(self, node_id, body):
         event = body.get("event", "")
@@ -614,6 +711,27 @@ class HomePage(QWidget):
             self.cards[label_text] = val_lbl
 
         self.layout.addLayout(cards_layout)
+
+        # Node summary area (compact, mirrors Key Management style)
+        nodes_title = QLabel("Nodes")
+        nodes_title.setProperty("class", "StatLabel")
+        nodes_title.setAlignment(Qt.AlignLeft)
+        nodes_title.setStyleSheet("font-size: 16px; margin-top: 8px;")
+        self.layout.addWidget(nodes_title)
+
+        self.nodes_widget = QWidget()
+        self.nodes_grid = QGridLayout(self.nodes_widget)
+        self.nodes_grid.setSpacing(10)
+        self.nodes_widget.setObjectName("NodesGridWidget")
+
+        nodes_scroll = QScrollArea()
+        nodes_scroll.setWidgetResizable(True)
+        nodes_scroll.setWidget(self.nodes_widget)
+        nodes_scroll.setFixedHeight(140)
+        nodes_scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
+
+        self.layout.addWidget(nodes_scroll)
+
         self.layout.addStretch(1)
 
     def refresh(self):
@@ -628,6 +746,52 @@ class HomePage(QWidget):
         self.cards["In Vault"].setText(str(vault))
         self.cards["Nodes Online"].setText(str(online))
         self.cards["Nodes Offline"].setText(str(offline))
+
+        # Rebuild node tiles
+        for i in reversed(range(self.nodes_grid.count())):
+            item = self.nodes_grid.takeAt(i)
+            if item is None:
+                continue
+            w = item.widget()
+            if w:
+                w.setParent(None)
+                w.deleteLater()
+
+        nodes = sorted(self.state.esp_nodes.keys())
+        if not nodes:
+            return
+        cols = min(max(1, len(nodes)), 6)
+
+        for i, node in enumerate(nodes):
+            online = bool(self.state.node_online.get(node, False))
+            model_ready = bool(self.state.model_state.get(node, False))
+            if online and model_ready:
+                color = "#4caf50"
+            elif online and not model_ready:
+                color = "#ffb300"
+            else:
+                color = "#9e9e9e"
+
+            tile = QFrame()
+            tile.setStyleSheet("QFrame { background-color: #ffffff; border-radius: 8px; padding: 6px; border: 1px solid #e0e0e0; }")
+            tl = QHBoxLayout(tile)
+            tl.setContentsMargins(8, 4, 8, 4)
+            tl.setSpacing(10)
+
+            badge = QLabel()
+            badge.setFixedSize(14, 14)
+            badge.setStyleSheet(f"background-color: {color}; border-radius: 7px; border: 1px solid rgba(0,0,0,0.08);")
+
+            name_lbl = QLabel(node)
+            name_lbl.setStyleSheet("font-weight: bold; background: transparent;")
+
+            tl.addWidget(badge)
+            tl.addWidget(name_lbl)
+            tl.addStretch(1)
+
+            row = i // cols
+            col = i % cols
+            self.nodes_grid.addWidget(tile, row, col)
 
 
 class KeyMgmtPage(QWidget):
@@ -654,11 +818,15 @@ class KeyMgmtPage(QWidget):
         self.layout.addWidget(scroll)
 
     def refresh(self):
-        for i in reversed(range(self.grid_layout.count())): 
-            widget = self.grid_layout.itemAt(i).widget()
+        for i in reversed(range(self.grid_layout.count())):
+            item = self.grid_layout.takeAt(i)
+            if item is None:
+                continue
+            widget = item.widget()
             if widget:
                 widget.setParent(None)
-                
+                widget.deleteLater()
+
         def extract_num(k_str):
             parts = k_str.split()
             if len(parts) > 1 and parts[1].isdigit():
@@ -770,8 +938,12 @@ class ESPConfigPage(QWidget):
 
         self.detail_table = QTableWidget(0, 5)
         self.detail_table.setHorizontalHeaderLabels(["State", "Trained?", "Train Rows", "Dev Rows", "Test Rows"])
-        self.detail_table.horizontalHeader().setStretchLastSection(True)
+        # Make columns equal width and rows uniform
+        self.detail_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.detail_table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.detail_table.verticalHeader().setDefaultSectionSize(36)
         self.detail_table.verticalHeader().setVisible(False)
+        self.detail_table.setWordWrap(False)
         self.detail_table.setEditTriggers(QTableWidget.NoEditTriggers)
         layout.addWidget(self.detail_table)
 
@@ -787,7 +959,9 @@ class ESPConfigPage(QWidget):
         labels_info = summary.get("labels", {}) if summary else {}
 
         for i, st in enumerate(CALIB_STATES):
-            self.detail_table.setItem(i, 0, QTableWidgetItem(st))
+            # Show per-state CSV file count excluding files starting with 'part_'
+            file_count = self.state.count_state_csv_files(node, st)
+            self.detail_table.setItem(i, 0, QTableWidgetItem(f"{st} ({file_count})"))
             done = self.state.esp_nodes.get(node, {}).get(st, False)
             self.detail_table.setItem(i, 1, QTableWidgetItem("Yes" if done else "No"))
             
@@ -935,15 +1109,43 @@ class ESPConfigPage(QWidget):
         node = self.node_selector.currentText()
         if not node:
             return
-        for state in CALIB_STATES:
-            self.state.esp_nodes[node][state] = False
-        self.state.collection_campaign.pop(node, None)
-        self.state.collection_run_counter.pop(node, None)
-        self.state.expected_calib.pop(node, None)
-        self.state.expected_session.pop(node, None)
-        self.state.persist()
-        self.parent.signals.error.emit(f"Reset calibrations for {node}")
-        self.refresh()
+        
+        reply = QMessageBox.question(
+            self, 
+            'Reset Calibrations',
+            f'Delete ALL calibration data for {node}?\n\nThis will:\n- Clear all state flags\n- Delete CSI data files\n- Delete model artifacts\n- Cannot be undone',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply != QMessageBox.Yes:
+            return
+        
+        try:
+            for state in CALIB_STATES:
+                self.state.esp_nodes[node][state] = False
+            
+            node_dir = os.path.join(self.state.config.get("csi_data_dir", CSI_DATA_DIR), node)
+            if os.path.isdir(node_dir):
+                shutil.rmtree(node_dir)
+            
+            node_model_dir = os.path.join(MODEL_STORE_DIR, node)
+            if os.path.isdir(node_model_dir):
+                shutil.rmtree(node_model_dir)
+            
+            self.state.collection_campaign.pop(node, None)
+            self.state.collection_run_counter.pop(node, None)
+            self.state.expected_calib.pop(node, None)
+            self.state.expected_session.pop(node, None)
+            self.state.model_state[node] = False
+            self.state.training_in_progress[node] = False
+            self.state.node_last_heartbeat[node] = 0.0
+            
+            self.state.persist()
+            self.parent.log_message(f"Reset calibrations for {node}")
+            self.refresh()
+        except Exception as e:
+            self.parent.log_message(f"Failed to reset {node}: {e}")
 
     def _notify_training_complete(self, node):
         topic = f"/commands/{node}/training_complete"
