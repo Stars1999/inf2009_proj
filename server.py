@@ -353,7 +353,7 @@ def on_mqtt_message(client, userdata, message):
             run_id = sess
         if campaign_id is None or not isinstance(campaign_id, str) or not campaign_id:
             campaign_id = sess
-                split_group = _normalize_split(split_group)
+        split_group = _normalize_split(split_group)
         with _active_sessions_lock:
             active_sessions[node_id] = {
                 "label": label,
@@ -863,7 +863,7 @@ def upload_data():
     return "OK", 200
 
 
-def start_server(host=os.getenv("SERVER_HOST", "0.0.0.0"), port=int(os.getenv("SERVER_PORT", "5000"))):
+def start_server(host=os.getenv("SERVER_HOST", "0.0.0.0"), port=int(os.getenv("SERVER_PORT", "6000"))):
     # Ensure the background cleanup thread is running before we start serving.
     _start_cleanup_thread()
 

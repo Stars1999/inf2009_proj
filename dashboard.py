@@ -10,7 +10,7 @@ import queue
 import shutil
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal, QObject
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QSignalBlocker
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -39,6 +39,8 @@ from PySide6.QtWidgets import (
 
 import pandas as pd
 import paho.mqtt.client as mqtt
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 
 from shared_config import DEFAULT_MQTT_BROKER, DEFAULT_MQTT_PORT
 
@@ -47,6 +49,29 @@ CSI_DATA_DIR = os.path.join(BASE_DIR, "csi_data")
 MODEL_STORE_DIR = os.path.join(BASE_DIR, "model_store")
 
 CALIB_STATES = ["door_closed", "door_open", "person_standing"]
+
+CSI_METADATA_COLUMNS = {
+    "node_id",
+    "collection_label",
+    "session_id",
+    "sub_batch_idx",
+    "subbatchidx",
+    "campaign_id",
+    "calibration_run_id",
+    "collection_split",
+    "payload_crc32",
+    "idempotency_key",
+    "upload_received_at",
+    "global_sample_idx",
+    "global_sampleidx",
+    "globalsampleidx",
+    "row_in_sub_batch",
+    "rowinsubbatch",
+    "row_in_subbatch",
+    "timestamp",
+    "time",
+    "label",
+}
 
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 CALIB_FILE = os.path.join(BASE_DIR, "calib_states.json")
@@ -129,12 +154,22 @@ QPushButton#ActionBtn {
 QPushButton#ActionBtn:hover {
     background-color: #43a047;
 }
+QPushButton#ActionBtn:disabled {
+    background-color: #b0bec5;
+    color: #ffffff;
+    cursor: not-allowed;
+}
 
 QPushButton#DangerBtn {
     background-color: #f44336;
 }
 QPushButton#DangerBtn:hover {
     background-color: #e53935;
+}
+QPushButton#DangerBtn:disabled {
+    background-color: #b0bec5;
+    color: #ffffff;
+    cursor: not-allowed;
 }
 
 /* Inputs */
@@ -245,7 +280,9 @@ class MqttClient(threading.Thread):
         self.client.on_connect = self.on_connect
         self.client.on_disconnect = self.on_disconnect
         self.client.on_message = self.on_message
+        self.client.reconnect_delay_set(min_delay=1, max_delay=30)
         self._stop = threading.Event()
+        self._has_logged_connected = False
 
     def _enqueue_event(self, event_type, *args):
         self.event_queue.put((event_type, *args))
@@ -274,12 +311,18 @@ class MqttClient(threading.Thread):
             client.subscribe("#", qos=1)
             client.subscribe("device/+/status", qos=1)
             client.subscribe("/sensors/+/status", qos=1)
-            self._enqueue_event("error", "MQTT connected")
+            if not self._has_logged_connected:
+                self._enqueue_event("error", "MQTT connected")
+            self._has_logged_connected = True
         else:
             self._enqueue_event("error", f"MQTT connect fail {reason_code}")
 
     def on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties=None):
-        self._enqueue_event("error", "MQTT disconnected")
+        if self._stop.is_set():
+            return
+        self._has_logged_connected = False
+        if reason_code != 0:
+            self._enqueue_event("error", f"MQTT disconnected (rc={reason_code})")
 
     def on_message(self, client, userdata, msg):
         try:
@@ -366,6 +409,8 @@ class AppState:
         self.expected_session = {}
         self.collection_campaign = {}
         self.collection_run_counter = {}
+        self.collection_in_progress = {n: False for n in self.esp_nodes}
+        self.collection_progress = {n: (0, 0) for n in self.esp_nodes}
         self.last_calib_choice = {}
         self.last_split_choice = {}
         self.training_in_progress = {n: False for n in self.esp_nodes}
@@ -401,6 +446,9 @@ class AppState:
             self.last_view = view.get("last_page", self.last_view)
             self.last_node = view.get("last_node", self.last_node)
         self.config.update(self.load_json(CONFIG_FILE, {}))
+        # Keep CSI path usable on the current host (legacy configs may contain
+        # stale absolute paths from another machine/OS).
+        self.config["csi_data_dir"] = self.resolve_csi_data_dir()
         self.node_last_heartbeat.update(self.load_json(HEARTBEAT_FILE, {}))
 
     def persist(self):
@@ -417,8 +465,37 @@ class AppState:
             return False
         return (time.time() - last) > HEARTBEAT_TIMEOUT_S
 
+    def resolve_csi_data_dir(self):
+        configured = self.config.get("csi_data_dir", "")
+        candidates = []
+        if isinstance(configured, str) and configured.strip():
+            candidates.append(configured.strip())
+        candidates.extend([
+            CSI_DATA_DIR,
+            os.path.join(BASE_DIR, "csi_data"),
+            "csi_data",
+        ])
+
+        seen = set()
+        for path in candidates:
+            if not isinstance(path, str) or not path.strip():
+                continue
+            try:
+                abs_path = os.path.abspath(path)
+            except Exception:
+                continue
+            if abs_path in seen:
+                continue
+            seen.add(abs_path)
+            if os.path.isdir(abs_path):
+                return abs_path
+
+        fallback = os.path.abspath(CSI_DATA_DIR)
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
+
     def node_data_dir(self, node):
-        base = self.config.get("csi_data_dir", CSI_DATA_DIR)
+        base = self.resolve_csi_data_dir()
         return os.path.join(base, node)
 
     def count_state_csv_files(self, node, state):
@@ -473,7 +550,9 @@ class AppState:
                 label_summary["rows_raw"] += rows
                 label_summary["rows_clean"] += rows
                 split_group = "train"
-                if "split_group" in df.columns:
+                if "collection_split" in df.columns:
+                    split_group = str(df["collection_split"].mode().iloc[0]).lower() if not df["collection_split"].mode().empty else "train"
+                elif "split_group" in df.columns:
                     split_group = str(df["split_group"].mode().iloc[0]).lower() if not df["split_group"].mode().empty else "train"
                 elif "dataset_split" in df.columns:
                     split_group = str(df["dataset_split"].mode().iloc[0]).lower() if not df["dataset_split"].mode().empty else "train"
@@ -647,6 +726,8 @@ class DashboardMain(QMainWindow):
         self.pages["Homepage"].refresh()
 
     def on_collection_progress(self, node_id, cur, total):
+        self.state.collection_in_progress[node_id] = True
+        self.state.collection_progress[node_id] = (cur, total)
         page = self.pages["ESP32-C3 Configuration"]
         page.set_progress(node_id, cur, total)
         # Refresh counts/display if the page is visible
@@ -656,6 +737,10 @@ class DashboardMain(QMainWindow):
     def on_collection_complete(self, node_id, label, session):
         self.log_message(f"Collection complete: {node_id}/{label} session={session}")
         self.state.esp_nodes[node_id][label] = True
+        self.state.collection_in_progress[node_id] = False
+        self.state.collection_progress[node_id] = (0, 0)
+        self.state.expected_calib.pop(node_id, None)
+        self.state.expected_session.pop(node_id, None)
         self.state.persist()
         if self.stack.currentWidget() == self.pages["ESP32-C3 Configuration"]:
             self.pages["ESP32-C3 Configuration"].refresh()
@@ -987,7 +1072,26 @@ class ESPConfigPage(QWidget):
         else:
             model_text = "No model loaded"
 
-        self.status_label.setText(f"Node: {node} | Status: {status.upper()} | Current State: {self.state.node_detected_state.get(node, 'unknown')} | {model_text}")
+        base_text = f"Node: {node} | Status: {status.upper()} | Current State: {self.state.node_detected_state.get(node, 'unknown')} | {model_text}"
+        cur, total = self.state.collection_progress.get(node, (0, 0))
+        ready_from_progress = total > 0 and cur >= total
+        collecting = bool(self.state.collection_in_progress.get(node, False))
+
+        # Calibration action state mirrors legacy behavior: disable while collecting,
+        # then re-enable once upload reaches the final sub-batch.
+        self.start_button.setEnabled(not (collecting and not ready_from_progress))
+
+        if self.state.training_in_progress.get(node, False):
+            self.status_label.setText("Training in progress...")
+        elif collecting:
+            if ready_from_progress:
+                self.status_label.setText(f"Status: Upload complete ({cur}/{total}) - waiting for server merge")
+            elif total > 0:
+                self.status_label.setText(f"Status: Calibrating {cur}/{total} sub-batches uploaded")
+            else:
+                self.status_label.setText("Status: Calibration started")
+        else:
+            self.status_label.setText(base_text)
 
         # Enable/disable training and load buttons appropriately
         can_train = all(self.state.esp_nodes.get(node, {}).get(s, False) for s in CALIB_STATES) and not self.state.training_in_progress.get(node, False)
@@ -1054,6 +1158,8 @@ class ESPConfigPage(QWidget):
             if info.rc == mqtt.MQTT_ERR_SUCCESS:
                 self.state.expected_calib[node] = label
                 self.state.expected_session[node] = run_id
+                self.state.collection_in_progress[node] = True
+                self.state.collection_progress[node] = (0, 0)
                 return True
             time.sleep(0.2 * (i + 1))
 
@@ -1070,11 +1176,14 @@ class ESPConfigPage(QWidget):
             return
 
         if self._publish_collect(node, label, split):
-            self.status_label.setText(f"Sent collect to {node} for {label} [{split}]")
-            self.state.esp_nodes[node][label] = True
+            self.status_label.setText(f"Status: Calibration started for {node} ({label}, {split})")
+            self.start_button.setEnabled(False)
+            self.calib_progress.setValue(0)
             self.state.persist()
-            self.refresh(initial=False)
+            self.refresh(force=False)
         else:
+            self.state.collection_in_progress[node] = False
+            self.state.collection_progress[node] = (0, 0)
             self.status_label.setText("Collect publish failed")
 
     def train_model(self):
@@ -1085,8 +1194,21 @@ class ESPConfigPage(QWidget):
         if self.training_button.isEnabled() is False:
             return
 
-        if any(not self.state.esp_nodes[node][s] for s in CALIB_STATES):
-            QMessageBox.information(self, "Training Not Ready", "Complete all calibration states first.")
+        # Pre-flight dataset checks: ensure each calibration label has files/rows
+        summary = self.state.build_dataset_summary(node)
+        if summary is None:
+            QMessageBox.warning(self, "Training Not Ready", f"No calibration data found for {node}.")
+            return
+        missing = []
+        for s in CALIB_STATES:
+            info = summary["labels"].get(s, {})
+            files = info.get("files", 0)
+            rows = info.get("rows_clean", 0)
+            if files <= 0 or rows <= 0:
+                missing.append(f"{s}: files={files}, rows={rows}")
+        if missing:
+            details = "\n".join(missing)
+            QMessageBox.critical(self, "Training Not Ready", "Training requires all 3 classes with data: door_open, door_closed, person_standing.\nMissing or incomplete:\n" + details)
             return
 
         self.state.training_in_progress[node] = True
@@ -1124,25 +1246,20 @@ class ESPConfigPage(QWidget):
                 success = True
 
             if success:
-                # Attempt to push the trained artifacts (model + scaler) to the server node directory
-                try:
-                    import push_model as _push_model
-                except Exception:
-                    _push_model = None
+                if not os.path.isfile(model_output):
+                    raise RuntimeError(f"Trained model file missing: {model_output}")
+                if not os.path.isfile(scaler_output):
+                    raise RuntimeError(f"Scaler params file missing: {scaler_output}")
 
+                # Use the existing dashboard MQTT connection to avoid spawning
+                # transient helper clients that appear as repeated connect/disconnect.
                 try:
-                    if _push_model is not None:
-                        # model_output and scaler_output should be paths inside MODEL_STORE_DIR by convention
-                        if os.path.isfile(model_output):
-                            _push_model.push_model_file(model_output, node)
-                        if os.path.isfile(scaler_output):
-                            _push_model.push_scaler_params(scaler_output, node)
-                        try:
-                            _push_model.trigger_model_load_mqtt(node)
-                        except Exception as e:
-                            self.parent.log_message(f"Failed to trigger device load via push_model: {e}")
+                    topic = f"/commands/{node}/load_model"
+                    info = self.parent.mqtt.client.publish(topic, "", qos=1)
+                    if getattr(info, "rc", None) != mqtt.MQTT_ERR_SUCCESS:
+                        self.parent.log_message(f"Failed to publish load_model for {node}: rc={getattr(info, 'rc', None)}")
                 except Exception as e:
-                    self.parent.log_message(f"push_model transfer failed: {e}")
+                    self.parent.log_message(f"Failed to publish load_model for {node}: {e}")
 
                 self.state.model_state[node] = True
                 self.state.persist()
@@ -1205,6 +1322,8 @@ class ESPConfigPage(QWidget):
             self.state.collection_run_counter.pop(node, None)
             self.state.expected_calib.pop(node, None)
             self.state.expected_session.pop(node, None)
+            self.state.collection_in_progress[node] = False
+            self.state.collection_progress[node] = (0, 0)
             self.state.model_state[node] = False
             self.state.training_in_progress[node] = False
             self.state.node_last_heartbeat[node] = 0.0
@@ -1215,8 +1334,8 @@ class ESPConfigPage(QWidget):
             def _bg_reset():
                 try:
                     import reset_helpers as _reset_helpers
-                    csi_root = self.state.config.get("csi_data_dir", CSI_DATA_DIR)
-                    ok = _reset_helpers.reset_node(node, csi_root=csi_root, model_root=MODEL_STORE_DIR, trigger_mqtt=True)
+                    csi_root = self.state.resolve_csi_data_dir()
+                    ok = _reset_helpers.reset_node(node, csi_root=csi_root, model_root=MODEL_STORE_DIR, trigger_mqtt=False)
                     if ok:
                         self.parent.log_message(f"Reset calibrations for {node} (background)")
                     else:
@@ -1225,78 +1344,28 @@ class ESPConfigPage(QWidget):
                     self.parent.log_message(f"Background reset failed: {e}")
 
             threading.Thread(target=_bg_reset, daemon=True).start()
+            try:
+                topic = f"/commands/{node}/reset_model"
+                payload = json.dumps({"reason": "dashboard_rack_reset"})
+                info = self.parent.mqtt.client.publish(topic, payload, qos=1)
+                if getattr(info, "rc", None) != mqtt.MQTT_ERR_SUCCESS:
+                    self.parent.log_message(f"Failed to publish reset_model for {node}: rc={getattr(info, 'rc', None)}")
+            except Exception as e:
+                self.parent.log_message(f"Failed to publish reset_model for {node}: {e}")
 
             # Update UI immediately to reflect reset
             try:
                 self.status_label.setText("Status: No model loaded")
                 # make it stand out as cleared
                 self.status_label.setStyleSheet("font-weight: bold; color: #d32f2f; margin-top: 10px; font-size: 15px;")
+                self.calib_progress.setValue(0)
+                self.start_button.setEnabled(True)
                 self.train_progress.setValue(0)
                 self.training_button.setEnabled(False)
             except Exception:
                 pass
 
             self.parent.log_message(f"Reset calibrations initiated for {node}")
-            self.refresh()
-        except Exception as e:
-            self.parent.log_message(f"Failed to reset {node}: {e}")
-
-            
-            # Clear transient state
-            self.state.collection_campaign.pop(node, None)
-            self.state.collection_run_counter.pop(node, None)
-            self.state.expected_calib.pop(node, None)
-            self.state.expected_session.pop(node, None)
-            self.state.model_state[node] = False
-            self.state.training_in_progress[node] = False
-            self.state.node_last_heartbeat[node] = 0.0
-            
-            # Persist state
-            self.state.persist()
-
-            # Trigger the ESP32 to reload model state so it drops any local model.
-            # Prefer the existing utility if available, fall back to publishing on the
-            # dashboard MQTT client if needed. Run in background to avoid UI freeze.
-            def _trigger_model_reload():
-                ok = False
-                try:
-                    # Try using push_model helper if present
-                    try:
-                        import push_model as _push_model
-                        ok = _push_model.trigger_model_load_mqtt(node)
-                    except Exception as e:
-                        self.parent.log_message(f"push_model helper unavailable or failed: {e}")
-
-                    if not ok:
-                        # Fallback: publish to /commands/<node>/load_model using existing client
-                        try:
-                            topic = f"/commands/{node}/load_model"
-                            if hasattr(self.parent, "mqtt") and getattr(self.parent.mqtt, "client", None):
-                                info = self.parent.mqtt.client.publish(topic, "", qos=1)
-                                if getattr(info, "rc", None) == mqtt.MQTT_ERR_SUCCESS:
-                                    self.parent.log_message(f"Triggered model load for {node} (fallback)")
-                                else:
-                                    self.parent.log_message(f"Fallback publish returned rc={getattr(info, 'rc', 'unknown')}")
-                            else:
-                                self.parent.log_message("No MQTT client available to trigger model reload")
-                        except Exception as e:
-                            self.parent.log_message(f"Fallback MQTT publish failed: {e}")
-                except Exception as e:
-                    self.parent.log_message(f"Model reload trigger failed: {e}")
-
-            threading.Thread(target=_trigger_model_reload, daemon=True).start()
-
-            # Update UI immediately to reflect reset
-            try:
-                self.status_label.setText("Status: No model loaded")
-                # make it stand out as cleared
-                self.status_label.setStyleSheet("font-weight: bold; color: #d32f2f; margin-top: 10px; font-size: 15px;")
-                self.train_progress.setValue(0)
-                self.training_button.setEnabled(False)
-            except Exception:
-                pass
-
-            self.parent.log_message(f"Reset calibrations for {node}")
             self.refresh()
         except Exception as e:
             self.parent.log_message(f"Failed to reset {node}: {e}")
@@ -1332,8 +1401,14 @@ class ESPConfigPage(QWidget):
             return
         if total <= 0:
             self.calib_progress.setValue(0)
+            self.start_button.setEnabled(False)
             return
         self.calib_progress.setValue(int(cur / total * 100))
+        self.start_button.setEnabled(cur >= total)
+        if cur < total:
+            self.status_label.setText(f"Status: {cur}/{total} sub-batches uploaded")
+        else:
+            self.status_label.setText(f"Status: Upload complete ({cur}/{total}) - waiting for server merge")
 
     def on_model_event(self, node, body):
         if self.node_selector.currentText() != node:
@@ -1347,9 +1422,17 @@ class GraphsPage(QWidget):
     def __init__(self, state):
         super().__init__()
         self.state = state
+        self.graph_popup = None
+        self.graph_ready = False
+        self._bulk_update = False
+        self.state_file_map = {}
+        self.state_data_cache = {}
+        self.feature_columns = []
+        self.state_stats = {}
+
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
-        
+
         title = QLabel("Dashboard Analytics")
         title.setObjectName("PageTitle")
         self.layout.addWidget(title)
@@ -1357,70 +1440,419 @@ class GraphsPage(QWidget):
         top_widget = QFrame()
         top_widget.setObjectName("StatCard")
         top_layout = QHBoxLayout(top_widget)
-        
+
         self.node_selector = QComboBox()
         self.node_selector.addItems(sorted(self.state.esp_nodes.keys()))
-        self.node_selector.currentTextChanged.connect(self.refresh)
-        
+        self.node_selector.currentTextChanged.connect(self.refresh_data)
         top_layout.addWidget(QLabel("Select Node:"))
         top_layout.addWidget(self.node_selector)
 
-        self.refresh_btn = QPushButton("Refresh Summary")
-        self.refresh_btn.clicked.connect(self.refresh)
-        top_layout.addWidget(self.refresh_btn)
+        self.split_selector = QComboBox()
+        self.split_selector.addItems(["train", "dev"])
+        self.split_selector.currentTextChanged.connect(self.refresh_data)
+        top_layout.addWidget(QLabel("Split:"))
+        top_layout.addWidget(self.split_selector)
 
-        self.plot_btn = QPushButton("Show Visual Data Distribution")
-        self.plot_btn.setObjectName("ActionBtn")
-        self.plot_btn.clicked.connect(self.plot_summary)
-        top_layout.addWidget(self.plot_btn)
+        self.show_graph_btn = QPushButton("Show Graph")
+        self.show_graph_btn.setObjectName("ActionBtn")
+        self.show_graph_btn.clicked.connect(self.show_graph)
+        self.show_graph_btn.setEnabled(False)
+        top_layout.addWidget(self.show_graph_btn)
+
         top_layout.addStretch(1)
-
         self.layout.addWidget(top_widget)
+
+        controls_widget = QFrame()
+        controls_widget.setObjectName("StatCard")
+        controls_layout = QHBoxLayout(controls_widget)
+
+        self.channel_frame = QFrame()
+        self.channel_layout = QVBoxLayout(self.channel_frame)
+        self.channel_layout.setContentsMargins(4, 4, 4, 4)
+        self.channel_layout.setSpacing(4)
+        self.channel_frame.setFixedWidth(260)
+
+        channel_scroll = QScrollArea()
+        channel_scroll.setWidgetResizable(True)
+        channel_scroll.setWidget(self.channel_frame)
+        channel_scroll.setFixedHeight(300)
+        controls_layout.addWidget(channel_scroll)
+
+        self.select_all_cb = QCheckBox("Select All Channels")
+        self.select_all_cb.setEnabled(False)
+        self.select_all_cb.stateChanged.connect(self.on_select_all)
+        self.channel_layout.addWidget(self.select_all_cb)
+
+        controls_layout.addStretch(1)
+        self.layout.addWidget(controls_widget)
 
         self.summary_text = QTextEdit()
         self.summary_text.setReadOnly(True)
         self.summary_text.setStyleSheet("font-family: Consolas, 'Courier New', monospace; font-size: 13px;")
         self.layout.addWidget(self.summary_text)
 
+        self.refresh_data()
+
+    def _close_graph_popup(self):
+        if self.graph_popup is not None:
+            try:
+                self.graph_popup.close()
+            except Exception:
+                pass
+        self.graph_popup = None
+        self.graph_ready = False
+
+    def _on_graph_popup_closed(self):
+        self.graph_popup = None
+        self.graph_ready = False
+
+    def node_data_dir(self, node):
+        base = self.state.config.get("csi_data_dir") if self.state.config.get("csi_data_dir") else CSI_DATA_DIR
+        return os.path.join(base, node)
+
+    def list_files_for(self, node, label, split):
+        node_dir = self.node_data_dir(node)
+        if not os.path.isdir(node_dir):
+            return []
+        label_dir = os.path.join(node_dir, label)
+        if not os.path.isdir(label_dir):
+            return []
+        files = sorted(glob.glob(os.path.join(label_dir, "*.csv")))
+        matched = []
+        for p in files:
+            if os.path.basename(p).startswith("part_"):
+                continue
+            if split is None:
+                matched.append(p)
+                continue
+            try:
+                df = pd.read_csv(p, nrows=10)
+                split_group = None
+                for col in ("collection_split", "split_group", "dataset_split"):
+                    if col in df.columns:
+                        split_group = str(df[col].mode().iloc[0]).lower() if not df[col].mode().empty else None
+                        break
+                if split_group == "test":
+                    split_group = "dev"
+                if split_group is None or split_group == split:
+                    matched.append(p)
+            except Exception:
+                matched.append(p)
+        return matched
+
+    def _feature_sort_key(self, name):
+        digits = "".join(ch for ch in str(name) if ch.isdigit())
+        if digits:
+            return (0, int(digits), str(name))
+        return (1, str(name))
+
+    def _feature_columns_from_df(self, df):
+        cols = []
+        for col in df.columns:
+            name = str(col).strip()
+            if name.lower() in CSI_METADATA_COLUMNS:
+                continue
+            if pd.api.types.is_numeric_dtype(df[col]):
+                cols.append(name)
+        return cols
+
+    def _set_channel_widgets_enabled(self, enabled):
+        for cb in getattr(self, "channel_checkboxes", []):
+            cb.setEnabled(enabled)
+        self.select_all_cb.setEnabled(enabled and bool(self.channel_checkboxes))
+
+    def refresh_data(self, *args):
+        node = self.node_selector.currentText()
+        split = self.split_selector.currentText()
+        self._close_graph_popup()
+
+        self.state_file_map = {}
+        self.state_data_cache = {}
+        self.feature_columns = []
+        self.state_stats = {}
+
+        feature_seen = set()
+        temp_frames = {}
+        summary_lines = [
+            f"Node: {node}",
+            f"Split: {split}",
+            "",
+        ]
+
+        total_files = 0
+        total_usable_files = 0
+        total_rows = 0
+
+        for state in CALIB_STATES:
+            files = self.list_files_for(node, state, split)
+            self.state_file_map[state] = files
+            total_files += len(files)
+
+            state_rows = 0
+            state_usable = 0
+            state_frames = []
+
+            for path in files:
+                try:
+                    df = pd.read_csv(path)
+                except Exception:
+                    continue
+
+                feature_cols = self._feature_columns_from_df(df)
+                if not feature_cols:
+                    continue
+
+                state_rows += len(df)
+                state_usable += 1
+                total_rows += len(df)
+                frame = df[feature_cols].copy()
+                state_frames.append(frame)
+                for col in feature_cols:
+                    if col not in feature_seen:
+                        feature_seen.add(col)
+                        self.feature_columns.append(col)
+
+            temp_frames[state] = state_frames
+            total_usable_files += state_usable
+            self.state_stats[state] = {
+                "files": len(files),
+                "usable_files": state_usable,
+                "rows": state_rows,
+            }
+            summary_lines.append(
+                f"{state}: files={len(files)} usable={state_usable} rows={state_rows}"
+            )
+
+        self.feature_columns.sort(key=self._feature_sort_key)
+
+        for state, frames in temp_frames.items():
+            aligned_frames = [frame.reindex(columns=self.feature_columns) for frame in frames]
+            if aligned_frames:
+                self.state_data_cache[state] = pd.concat(aligned_frames, ignore_index=True)
+            else:
+                self.state_data_cache[state] = pd.DataFrame(columns=self.feature_columns)
+
+        summary_lines.extend([
+            "",
+            f"Feature channels detected: {len(self.feature_columns)}",
+            f"Matched files: {total_files}",
+            f"Usable files: {total_usable_files}",
+            f"Total rows loaded: {total_rows}",
+            "",
+            "Click Show Graph to open the popup comparison.",
+        ])
+
+        self.summary_text.setPlainText("\n".join(summary_lines))
+
+        self.channel_layout_parent_clear()
+        self.channel_checkboxes = []
+        for col in self.feature_columns:
+            cb = QCheckBox(col)
+            cb.setChecked(True)
+            cb.setEnabled(False)
+            cb.stateChanged.connect(self.on_channel_toggle)
+            self.channel_layout.addWidget(cb)
+            self.channel_checkboxes.append(cb)
+
+        self.select_all_cb.setEnabled(False)
+        self.select_all_cb.setChecked(bool(self.channel_checkboxes))
+        self.show_graph_btn.setEnabled(bool(self.feature_columns))
+
+    def channel_layout_parent_clear(self):
+        for i in reversed(range(self.channel_layout.count())):
+            item = self.channel_layout.takeAt(i)
+            if item is None:
+                continue
+            w = item.widget()
+            if w is self.select_all_cb:
+                continue
+            if w:
+                w.setParent(None)
+                w.deleteLater()
+        self.channel_layout.insertWidget(0, self.select_all_cb)
+
+    def _selected_channels(self):
+        return [cb.text() for cb in getattr(self, "channel_checkboxes", []) if cb.isChecked()]
+
+    def _state_display_name(self, state):
+        return {
+            "door_closed": "Door Closed",
+            "door_open": "Door Open",
+            "person_standing": "Person Standing",
+        }.get(state, state)
+
+    def _render_graph(self, selected_channels):
+        if self.graph_popup is None:
+            self.graph_popup = GraphPopupWindow(on_close=self._on_graph_popup_closed)
+
+        self.graph_popup.setWindowTitle(
+            f"CSI Signature Comparison ({self.node_selector.currentText()}, {self.split_selector.currentText()} split)"
+        )
+        self.graph_popup.render_comparison(
+            node=self.node_selector.currentText(),
+            split=self.split_selector.currentText(),
+            selected_channels=selected_channels,
+            state_data_cache=self.state_data_cache,
+            state_display_name=self._state_display_name,
+        )
+        self.graph_popup.showMaximized()
+        self.graph_popup.raise_()
+        self.graph_popup.activateWindow()
+
+    def show_graph(self):
+        if not self.feature_columns:
+            QMessageBox.information(self, "No Data", "No CSI channels were found for this rack/split.")
+            return
+        selected = self._selected_channels()
+        if not selected:
+            QMessageBox.information(self, "No Channels", "Select at least one channel to plot.")
+            return
+
+        self._render_graph(selected)
+        for cb in getattr(self, "channel_checkboxes", []):
+            cb.setEnabled(True)
+        self.select_all_cb.setEnabled(True if self.channel_checkboxes else False)
+        all_checked = all(cb.isChecked() for cb in self.channel_checkboxes) if self.channel_checkboxes else False
+        blocker = QSignalBlocker(self.select_all_cb)
+        self.select_all_cb.setChecked(all_checked)
+        del blocker
+        self.graph_ready = True
+
+    def on_channel_toggle(self, *_):
+        if self._bulk_update or not self.graph_ready:
+            return
+        selected = self._selected_channels()
+        if not selected:
+            if self.graph_popup is not None:
+                self.graph_popup.clear_message("No channels selected")
+            return
+        self._render_graph(selected)
+        if self.channel_checkboxes:
+            all_checked = all(cb.isChecked() for cb in self.channel_checkboxes)
+            blocker = QSignalBlocker(self.select_all_cb)
+            self.select_all_cb.setChecked(all_checked)
+            del blocker
+
+    def on_select_all(self, state):
+        if not self.channel_checkboxes:
+            return
+        check = int(state) == Qt.CheckState.Checked.value
+        self._bulk_update = True
+        try:
+            for cb in self.channel_checkboxes:
+                cb.setChecked(check)
+        finally:
+            self._bulk_update = False
+        if self.graph_ready:
+            self.on_channel_toggle()
+
     def refresh(self):
         node = self.node_selector.currentText()
+        split = self.split_selector.currentText()
         if not node:
             self.summary_text.setPlainText("No node selected")
             return
-
-        summary = self.state.build_dataset_summary(node)
-        if not summary:
-            self.summary_text.setPlainText(f"No CSI data available for {node}")
+        if not self.feature_columns:
+            self.summary_text.setPlainText(f"No CSI data available for {node} ({split} split)")
             return
-
-        lines = [f"Node: {node}", f"Generated: {summary.get('generated_at')}", f"Total files: {summary.get('total_files')}", f"Total rows: {summary.get('total_rows')}", ""]
-        for label, info in summary.get("labels", {}).items():
-            lines.append(f"{label}: files={info.get('files')} sessions={info.get('sessions')} rows={info.get('rows_clean')}")
-            lines.append(f"  splits -> train={info['split_rows'].get('train',0)} dev={info['split_rows'].get('dev',0)}")
+        lines = [
+            f"Node: {node}",
+            f"Split: {split}",
+            "",
+        ]
+        for state in CALIB_STATES:
+            info = self.state_stats.get(state, {})
+            lines.append(
+                f"{state}: files={info.get('files', 0)} usable={info.get('usable_files', 0)} rows={info.get('rows', 0)}"
+            )
+        lines.extend([
+            "",
+            f"Feature channels: {len(self.feature_columns)}",
+            f"Selected channels: {sum(1 for cb in self.channel_checkboxes if cb.isChecked()) if self.channel_checkboxes else 0}",
+            "",
+            "Click Show Graph to open the popup comparison.",
+        ])
         self.summary_text.setPlainText("\n".join(lines))
 
-    def plot_summary(self):
-        node = self.node_selector.currentText()
-        if not node:
+
+class GraphPopupWindow(QMainWindow):
+    def __init__(self, on_close=None):
+        super().__init__()
+        self._on_close = on_close
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.figure = Figure(figsize=(11, 7))
+        self.canvas = FigureCanvas(self.figure)
+        self.setCentralWidget(self.canvas)
+        self.resize(1200, 760)
+
+    def closeEvent(self, event):
+        if callable(self._on_close):
+            self._on_close()
+        self.deleteLater()
+        super().closeEvent(event)
+
+    def clear_message(self, message):
+        fig = self.figure
+        fig.clear()
+        ax = fig.add_subplot(111)
+        ax.text(0.5, 0.5, message, ha="center", va="center", transform=ax.transAxes, fontsize=16)
+        ax.set_axis_off()
+        self.canvas.draw()
+
+    def render_comparison(self, node, split, selected_channels, state_data_cache, state_display_name):
+        fig = self.figure
+        fig.clear()
+        ax = fig.add_subplot(111)
+
+        if not selected_channels:
+            self.clear_message("No channels selected")
             return
-        summary = self.state.build_dataset_summary(node)
-        if not summary or "labels" not in summary:
-            QMessageBox.information(self, "No Data", f"No dataset data for {node}")
+
+        x = list(range(len(selected_channels)))
+        colors = {
+            "door_closed": "#7b1fa2",
+            "door_open": "#2e7d32",
+            "person_standing": "#212121",
+        }
+        linestyles = {
+            "door_closed": "-",
+            "door_open": "-",
+            "person_standing": "--",
+        }
+
+        plotted_any = False
+        for state in CALIB_STATES:
+            df = state_data_cache.get(state)
+            if df is None or df.empty:
+                continue
+            aligned = df.reindex(columns=selected_channels)
+            series = aligned.mean(axis=0)
+            if series.isna().all():
+                continue
+            ax.plot(
+                x,
+                series.values,
+                label=f"{split.title()}: {state_display_name(state)}",
+                color=colors.get(state, "#1976d2"),
+                linestyle=linestyles.get(state, "-"),
+                linewidth=2,
+            )
+            plotted_any = True
+
+        if not plotted_any:
+            self.clear_message("No matching CSI data found for the selected channels")
             return
 
-        import matplotlib.pyplot as plt
-
-        labels = list(summary["labels"].keys())
-        rows = [summary["labels"][s]["rows_clean"] for s in labels]
-
-        plt.figure(figsize=(10, 4))
-        plt.bar(labels, rows, color=["#4caf50", "#2196f3", "#ff9800"])
-        plt.title(f"CSI row count by label for {node}")
-        plt.ylabel("Rows")
-        plt.xlabel("Label")
-        plt.grid(axis="y", alpha=0.3)
-        plt.tight_layout()
-        plt.show()
+        ax.set_title(f"CSI Signature Comparison ({node}, {split} split)")
+        ax.set_xlabel("CSI feature channels")
+        ax.set_ylabel("Mean signal")
+        ax.set_xticks(x)
+        ax.set_xticklabels(selected_channels, rotation=90, fontsize=7)
+        ax.legend(loc="best", fontsize="small")
+        ax.grid(True, alpha=0.3)
+        ax.margins(x=0.01)
+        fig.tight_layout()
+        self.canvas.draw()
 
 
 class SettingsPage(QWidget):
