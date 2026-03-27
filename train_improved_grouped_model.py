@@ -94,10 +94,23 @@ def load_state_data(base_dir, node, state):
     return pd.concat(dfs, ignore_index=True)
 
 
+def parse_args():
+    import argparse
+    parser = argparse.ArgumentParser(description="Train grouped RF model for ESP32 nodes")
+    parser.add_argument("--node", default="RACK_1", help="Node ID, e.g. RACK_1")
+    parser.add_argument("--data-dir", default="csi_data", help="CSI data base directory")
+    parser.add_argument("--output-dir", default="model_store", help="Output model store directory")
+    parser.add_argument("--no-save-model", action="store_true", help="Skip saving symbolic model file")
+    return parser.parse_args()
+
+
 def main():
-    data_dir = "csi_data"
-    node = "RACK_1"
-    output_scaler = f"model_store/{node}/scaler_params.json"
+    args = parse_args()
+    data_dir = args.data_dir
+    node = args.node
+    output_dir = args.output_dir
+    output_scaler = os.path.join(output_dir, node, "scaler_params.json")
+    model_output = os.path.join(output_dir, node, "model.tflite")
     
     # Create output directory
     os.makedirs(os.path.dirname(output_scaler), exist_ok=True)

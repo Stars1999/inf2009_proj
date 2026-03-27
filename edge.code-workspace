@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "../edge-esp32"
+		},
+		{
+			"path": "."
+		}
+	],
+	"settings": {}
+}

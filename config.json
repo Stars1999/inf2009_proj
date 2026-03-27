@@ -1,0 +1,5 @@
+{
+  "broker": "localhost",
+  "port": 1883,
+  "csi_data_dir": "C:\\Users\\ianko\\git\\inf2009_proj\\csi_data"
+}
