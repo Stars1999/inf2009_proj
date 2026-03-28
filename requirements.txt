@@ -231,7 +231,7 @@ six==1.17.0
     #   tensorflow-model-optimization
 tensorflow==2.21.0
     # via -r requirements.in
-tensorflow-model-optimization==0.8.0
+# tensorflow-model-optimization==0.8.0  # moved to requirements-tfmot.txt
     # via -r requirements.in
 termcolor==3.3.0
     # via

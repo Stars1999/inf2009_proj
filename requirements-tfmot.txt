@@ -1,0 +1,10 @@
+# tensorflow-model-optimization moved to this file because it has delicate runtime compatibility with TensorFlow/Keras.
+# Use a separate venv when you need tfmot (quantization/optimization):
+# python -m venv venv-tfmot
+# source venv-tfmot/bin/activate
+# pip install -r requirements-tfmot.txt
+
+tensorflow-model-optimization==0.8.0
+
+# Optionally, if tfmot import complains about legacy Keras, try installing the compatibility package:
+# tf_keras
