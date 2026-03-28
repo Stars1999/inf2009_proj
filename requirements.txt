@@ -32,7 +32,7 @@ ml_dtypes==0.5.4
 dm-tree==0.1.9
 attrs==23.1.0
 namex==0.1.0
-numpy==1.23.6
+numpy==1.23.5
 opt_einsum==3.4.0
 optree==0.19.0
 packaging==26.0
