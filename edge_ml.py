@@ -67,7 +67,18 @@ def extract_features(
     calibration_val: float | None = None,
     group_count: int = 0,
 ) -> np.ndarray:
-    """Notebook-equivalent feature extraction."""
+    """Notebook-equivalent feature extraction (matches Edge_ML (1).ipynb cell 1).
+    
+    For each row i:
+        1. Extract window: calibrated_data[max(0, i-window_size+1):i+1, :]
+        2. Compute current_frame: calibrated_data[i, :]
+        3. Compute temp_std: per-subcarrier std over window
+        4. Compute avg_variation: mean of temp_std
+        5. Normalize by calibration_val if provided: avg_variation / (calibration_val + 1e-8)
+        6. Return [current_frame..., avg_variation]
+    
+    This matches ESP32 receiver.cpp::build_notebook_frame_features().
+    """
     raw_data = df[feature_cols].to_numpy(dtype=np.float32)
     calibrated_data = raw_data + float(session_offset)
     num_rows = calibrated_data.shape[0]
@@ -131,6 +142,17 @@ def _representative_dataset_gen(x_calib: np.ndarray, max_samples: int = 100):
 
 
 def build_model(tf, input_dim: int):
+    """Build Keras model matching Edge_ML (1).ipynb cell 3 architecture.
+    
+    Architecture:
+        Dense(256, relu) → BatchNorm → Dropout(0.4)
+        Dense(128, relu) → BatchNorm → Dropout(0.2)
+        Dense(64, relu)
+        Dense(3, softmax)
+    
+    Optimizer: Adam(lr=0.0005)
+    Loss: sparse_categorical_crossentropy
+    """
     model = tf.keras.Sequential([
         tf.keras.layers.Input(shape=(input_dim,)),
         tf.keras.layers.Dense(256, activation="relu"),
@@ -347,6 +369,8 @@ def main() -> int:
         if open_calibration_seed.empty:
             raise RuntimeError("door_open calibration frames are empty; cannot compute train baseline")
 
+        # Compute train_baseline from first cal_frames of door_open (matches notebook cell 2)
+        # train_baseline = np.mean(extract_features(df_open.head(cal_frames), feature_cols)[:, -1])
         train_baseline = float(
             np.mean(
                 extract_features(
@@ -359,6 +383,8 @@ def main() -> int:
             )
         )
 
+        # Extract features with calibration (matches notebook cell 2)
+        # X = extract_features(df_combined, feature_cols, calibration_val=train_baseline)
         x = extract_features(
             df_combined,
             feature_cols,
@@ -536,6 +562,8 @@ def main() -> int:
         with open(args.output, "wb") as f:
             f.write(tflite_model)
 
+        # Compute train_mean from combined dataset (used for session offset in inference)
+        # Matches notebook cell 8 where offset = train_mean - session_mean
         train_mean = float(df_combined[feature_cols].to_numpy(dtype=np.float32).mean())
         _save_scaler_params(
             args.scaler_output,

@@ -1,0 +1,68 @@
+         122798 function calls (121291 primitive calls) in 0.163 seconds
+
+   Ordered by: cumulative time
+   List reduced from 728 to 60 due to restriction <60>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.000    0.000    0.163    0.163 /home/iankoh/inf2009_proj/tools/full_profile_dashboards.py:125(make_new)
+        1    0.000    0.000    0.156    0.156 /home/iankoh/inf2009_proj/dashboard.py:574(__init__)
+        1    0.001    0.001    0.155    0.155 /home/iankoh/inf2009_proj/dashboard.py:600(setup_ui)
+        1    0.001    0.001    0.104    0.104 /home/iankoh/inf2009_proj/dashboard.py:1489(__init__)
+        1    0.001    0.001    0.102    0.102 /home/iankoh/inf2009_proj/dashboard.py:1606(refresh_data)
+       13    0.000    0.000    0.063    0.005 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/io/parsers/readers.py:349(read_csv)
+       13    0.000    0.000    0.063    0.005 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/io/parsers/readers.py:258(_read)
+       13    0.000    0.000    0.054    0.004 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/io/parsers/readers.py:1931(read)
+        3    0.001    0.000    0.047    0.016 /home/iankoh/inf2009_proj/dashboard.py:1552(list_files_for)
+       13    0.000    0.000    0.036    0.003 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/frame.py:702(__init__)
+       13    0.001    0.000    0.036    0.003 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/internals/construction.py:375(dict_to_mgr)
+       13    0.000    0.000    0.027    0.002 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/internals/construction.py:96(arrays_to_mgr)
+      806    0.006    0.000    0.020    0.000 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/construction.py:531(sanitize_array)
+       13    0.001    0.000    0.020    0.002 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/internals/construction.py:553(_homogenize)
+      242    0.001    0.000    0.018    0.000 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/frame.py:4337(__getitem__)
+        1    0.013    0.013    0.018    0.018 /home/iankoh/inf2009_proj/dashboard.py:978(__init__)
+       13    0.010    0.001    0.017    0.001 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/io/parsers/c_parser_wrapper.py:203(read)
+        1    0.015    0.015    0.015    0.015 {method 'setCentralWidget' of 'PySide6.QtWidgets.QMainWindow' objects}
+        5    0.001    0.000    0.013    0.003 /home/iankoh/inf2009_proj/dashboard.py:1588(_feature_columns_from_df)
+28018/27982    0.006    0.000    0.010    0.000 {built-in method builtins.isinstance}
+       13    0.000    0.000    0.009    0.001 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/io/parsers/readers.py:1600(__init__)
+      114    0.000    0.000    0.008    0.000 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/indexes/base.py:7919(ensure_index)
+      238    0.000    0.000    0.008    0.000 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/frame.py:4966(_get_item)
+       52    0.001    0.000    0.008    0.000 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/indexes/base.py:486(__new__)
+       13    0.000    0.000    0.008    0.001 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/io/parsers/readers.py:1871(_make_engine)
+        1    0.000    0.000    0.008    0.008 /home/iankoh/inf2009_proj/dashboard.py:658(switch_view)
+      238    0.000    0.000    0.007    0.000 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/frame.py:4292(_ixs)
+       13    0.000    0.000    0.007    0.001 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/internals/managers.py:2311(create_block_manager_from_column_arrays)
+       13    0.000    0.000    0.007    0.001 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/internals/managers.py:2380(_form_blocks)
+       13    0.001    0.000    0.007    0.001 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/internals/managers.py:2426(_tuples_to_blocks_no_consolidate)
+        1    0.000    0.000    0.007    0.007 {method 'close' of 'PySide6.QtWidgets.QWidget' objects}
+       10    0.000    0.000    0.006    0.001 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/internals/managers.py:718(copy)
+        1    0.001    0.001    0.006    0.006 /home/iankoh/inf2009_proj/dashboard.py:829(refresh)
+        4    0.000    0.000    0.006    0.002 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/generic.py:6560(copy)
+        3    0.000    0.000    0.006    0.002 /usr/lib/python3.13/enum.py:695(__call__)
+       71    0.006    0.000    0.006    0.000 {method 'addWidget' of 'PySide6.QtWidgets.QBoxLayout' objects}
+        1    0.000    0.000    0.006    0.006 /usr/lib/python3.13/enum.py:842(_create_)
+       13    0.002    0.000    0.005    0.000 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/io/parsers/c_parser_wrapper.py:336(_concatenate_chunks)
+       14    0.000    0.000    0.005    0.000 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/series.py:2093(mode)
+       13    0.004    0.000    0.005    0.000 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/io/parsers/c_parser_wrapper.py:65(__init__)
+        4    0.000    0.000    0.005    0.001 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/internals/managers.py:1954(_consolidate_inplace)
+      758    0.002    0.000    0.005    0.000 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/internals/blocks.py:2245(new_block_2d)
+       25    0.004    0.000    0.004    0.000 {method 'setStyleSheet' of 'PySide6.QtWidgets.QWidget' objects}
+      238    0.001    0.000    0.004    0.000 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/frame.py:4954(_box_col_values)
+        4    0.000    0.000    0.004    0.001 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/generic.py:4010(take)
+        4    0.000    0.000    0.004    0.001 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/internals/managers.py:2449(_consolidate)
+        4    0.000    0.000    0.004    0.001 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/internals/managers.py:1044(take)
+        8    0.000    0.000    0.004    0.000 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/internals/managers.py:792(reindex_indexer)
+  967/788    0.000    0.000    0.004    0.000 {built-in method __new__ of type object at 0x9f3a38}
+        1    0.000    0.000    0.004    0.004 /usr/lib/python3.13/enum.py:498(__new__)
+      228    0.001    0.000    0.003    0.000 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/internals/managers.py:879(_slice_take_blocks_ax0)
+     3686    0.002    0.000    0.003    0.000 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/dtypes/generic.py:43(_instancecheck)
+      179    0.001    0.000    0.003    0.000 /usr/lib/python3.13/enum.py:251(__set_name__)
+       27    0.000    0.000    0.003    0.000 {built-in method builtins.sorted}
+      238    0.001    0.000    0.003    0.000 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/internals/managers.py:1205(iget)
+      448    0.000    0.000    0.003    0.000 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/internals/managers.py:2454(<lambda>)
+        4    0.003    0.001    0.003    0.001 {method 'addWidget' of 'PySide6.QtWidgets.QGridLayout' objects}
+       14    0.000    0.000    0.003    0.000 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/arrays/base.py:2677(_mode)
+      153    0.002    0.000    0.003    0.000 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/arrays/string_.py:756(_from_sequence)
+       14    0.001    0.000    0.003    0.000 /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/algorithms.py:996(mode)
+
+

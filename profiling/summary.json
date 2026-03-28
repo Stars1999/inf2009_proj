@@ -1,0 +1,35 @@
+[
+  {
+    "phase": "import",
+    "module": "dashboard",
+    "elapsed_s": 0.839173503999973,
+    "exception": null
+  },
+  {
+    "phase": "import",
+    "module": "_legacy_dashboard_ref",
+    "elapsed_s": 0.9328120590000708,
+    "exception": null
+  },
+  {
+    "name": "new_dashboard_init",
+    "elapsed_s": 0.16271502899996904,
+    "exception": null,
+    "prof_path": "/home/iankoh/inf2009_proj/profiling/new_dashboard_init.prof",
+    "stats_txt": "/home/iankoh/inf2009_proj/profiling/new_dashboard_init_stats.txt"
+  },
+  {
+    "name": "legacy_dashboard_init",
+    "elapsed_s": 0.9773170969999683,
+    "exception": null,
+    "prof_path": "/home/iankoh/inf2009_proj/profiling/legacy_dashboard_init.prof",
+    "stats_txt": "/home/iankoh/inf2009_proj/profiling/legacy_dashboard_init_stats.txt"
+  },
+  {
+    "name": "new_build_dataset_summary",
+    "elapsed_s": 0.05614144099990881,
+    "exception": null,
+    "prof_path": "/home/iankoh/inf2009_proj/profiling/new_build_dataset_summary.prof",
+    "stats_txt": "/home/iankoh/inf2009_proj/profiling/new_build_dataset_summary_stats.txt"
+  }
+]

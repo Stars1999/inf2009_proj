@@ -10,7 +10,7 @@ import queue
 import shutil
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal, QObject, QSignalBlocker
+from PySide6.QtCore import Qt, QTimer, Signal, QObject
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QScrollArea,
+    QSizePolicy,
 )
 
 import pandas as pd
@@ -157,7 +158,6 @@ QPushButton#ActionBtn:hover {
 QPushButton#ActionBtn:disabled {
     background-color: #b0bec5;
     color: #ffffff;
-    cursor: not-allowed;
 }
 
 QPushButton#DangerBtn {
@@ -169,7 +169,6 @@ QPushButton#DangerBtn:hover {
 QPushButton#DangerBtn:disabled {
     background-color: #b0bec5;
     color: #ffffff;
-    cursor: not-allowed;
 }
 
 /* Inputs */
@@ -614,7 +613,7 @@ class DashboardMain(QMainWindow):
         sidebar.setSpacing(5)
 
         # Title/Logo area in sidebar
-        logo_label = QLabel("Zero-Trust\\nKey Governance")
+        logo_label = QLabel("Zero-Trust\nKey Governance")
         logo_label.setAlignment(Qt.AlignCenter)
         logo_label.setStyleSheet("font-size: 20px; font-weight: bold; color: #1976d2; margin-bottom: 20px;")
         sidebar.addWidget(logo_label)
@@ -659,12 +658,8 @@ class DashboardMain(QMainWindow):
     def switch_view(self, name):
         for btn_name, btn in self.buttons.items():
             btn.setChecked(btn_name == name)
-            
-        if name == "ESP32-C3 Configuration":
-            self.pages[name].refresh()
-        if name == "Logs":
-            self.pages[name].refresh()
-        if name == "Graphs":
+
+        if name in ("ESP32-C3 Configuration", "Homepage", "Key Management", "Logs", "Graphs"):
             self.pages[name].refresh()
 
         self.state.last_view = name
@@ -742,6 +737,17 @@ class DashboardMain(QMainWindow):
         self.state.expected_calib.pop(node_id, None)
         self.state.expected_session.pop(node_id, None)
         self.state.persist()
+
+        # Immediately reset the calibration progress UI to default (avoid lingering 100%)
+        page = self.pages.get("ESP32-C3 Configuration")
+        if page:
+            try:
+                page.set_progress(node_id, 0, 0)
+                # ensure UI refresh reflects new state
+                page.refresh()
+            except Exception:
+                pass
+
         if self.stack.currentWidget() == self.pages["ESP32-C3 Configuration"]:
             self.pages["ESP32-C3 Configuration"].refresh()
 
@@ -807,18 +813,16 @@ class HomePage(QWidget):
         nodes_title.setStyleSheet("font-size: 16px; margin-top: 8px;")
         self.layout.addWidget(nodes_title)
 
+        # Use a grid layout that wraps into rows so nodes always fit on screen
         self.nodes_widget = QWidget()
         self.nodes_grid = QGridLayout(self.nodes_widget)
         self.nodes_grid.setSpacing(10)
         self.nodes_widget.setObjectName("NodesGridWidget")
+        # Allow the widget to expand and let the main layout manage wrapping
+        self.nodes_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
-        nodes_scroll = QScrollArea()
-        nodes_scroll.setWidgetResizable(True)
-        nodes_scroll.setWidget(self.nodes_widget)
-        nodes_scroll.setFixedHeight(140)
-        nodes_scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
-
-        self.layout.addWidget(nodes_scroll)
+        # Add the nodes widget directly (no scroll area) so tiles wrap to next rows
+        self.layout.addWidget(self.nodes_widget)
 
         self.layout.addStretch(1)
 
@@ -853,6 +857,23 @@ class HomePage(QWidget):
         for i, node in enumerate(nodes):
             online = bool(self.state.node_online.get(node, False))
             model_ready = bool(self.state.model_state.get(node, False))
+            node_state = (self.state.node_detected_state.get(node) or "").strip()
+            if node_state == "door_open":
+                node_state_text = "DOOR OPEN"
+                node_state_color = "#d32f2f"
+            elif node_state == "door_closed":
+                node_state_text = "DOOR CLOSED"
+                node_state_color = "#2e7d32"
+            elif node_state == "person_standing":
+                node_state_text = "PERSON STANDING"
+                node_state_color = "#ff8f00"
+            elif online:
+                node_state_text = "ONLINE"
+                node_state_color = "#1976d2"
+            else:
+                node_state_text = "UNKNOWN"
+                node_state_color = "#607d8b"
+
             if online and model_ready:
                 color = "#4caf50"
             elif online and not model_ready:
@@ -861,20 +882,24 @@ class HomePage(QWidget):
                 color = "#9e9e9e"
 
             tile = QFrame()
-            tile.setStyleSheet("QFrame { background-color: #ffffff; border-radius: 8px; padding: 6px; border: 1px solid #e0e0e0; }")
+            tile.setStyleSheet("QFrame { background-color: #ffffff; border-radius: 8px; padding: 8px; border: 1px solid #e0e0e0; }")
             tl = QHBoxLayout(tile)
-            tl.setContentsMargins(8, 4, 8, 4)
-            tl.setSpacing(10)
+            tl.setContentsMargins(10, 6, 10, 6)
+            tl.setSpacing(12)
 
             badge = QLabel()
-            badge.setFixedSize(14, 14)
+            badge.setFixedSize(16, 16)
             badge.setStyleSheet(f"background-color: {color}; border-radius: 7px; border: 1px solid rgba(0,0,0,0.08);")
 
             name_lbl = QLabel(node)
-            name_lbl.setStyleSheet("font-weight: bold; background: transparent;")
+            name_lbl.setStyleSheet("font-size: 18px; font-weight: bold; background: transparent;")
+
+            state_lbl = QLabel(node_state_text)
+            state_lbl.setStyleSheet(f"font-size: 20px; font-weight: bold; color: {node_state_color}; background: transparent;")
 
             tl.addWidget(badge)
             tl.addWidget(name_lbl)
+            tl.addWidget(state_lbl)
             tl.addStretch(1)
 
             row = i // cols
@@ -927,18 +952,19 @@ class KeyMgmtPage(QWidget):
         for i, (k, v) in enumerate(keys):
             frame = QFrame()
             color = "#4caf50" if v == "in" else "#f44336"
-            frame.setStyleSheet(f"QFrame {{ background-color: {color}; color: white; border-radius: 8px; padding: 15px; border: 1px solid rgba(0,0,0,0.1); }}")
+            frame.setStyleSheet(f"QFrame {{ background-color: {color}; color: white; border-radius: 8px; padding: 16px; border: 1px solid rgba(0,0,0,0.1); }}")
             
             flay = QVBoxLayout(frame)
             flay.setContentsMargins(5, 10, 5, 10)
+            flay.setSpacing(8)
             
             lbl = QLabel(k)
             lbl.setAlignment(Qt.AlignCenter)
-            lbl.setStyleSheet("font-size: 16px; font-weight: bold; background: transparent; border: none;")
+            lbl.setStyleSheet("font-size: 18px; font-weight: bold; background: transparent; border: none;")
             
             status_lbl = QLabel(v.upper())
             status_lbl.setAlignment(Qt.AlignCenter)
-            status_lbl.setStyleSheet("font-size: 12px; font-weight: normal; opacity: 0.9; background: transparent; border: none;")
+            status_lbl.setStyleSheet("font-size: 21px; font-weight: bold; opacity: 0.95; background: transparent; border: none;")
             
             flay.addWidget(lbl)
             flay.addWidget(status_lbl)
@@ -1034,11 +1060,52 @@ class ESPConfigPage(QWidget):
         # Make columns equal width and rows uniform
         self.detail_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.detail_table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
-        self.detail_table.verticalHeader().setDefaultSectionSize(36)
+        # Slightly larger default row height; will be adjusted on resize
+        self.detail_table.verticalHeader().setDefaultSectionSize(44)
         self.detail_table.verticalHeader().setVisible(False)
         self.detail_table.setWordWrap(False)
         self.detail_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        # Increase default font size for readability; will be adjusted dynamically
+        self.detail_table.setStyleSheet("QTableWidget { font-size: 14px; } QHeaderView::section { font-weight: bold; font-size: 15px; }")
+        self.detail_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self.detail_table)
+
+    def resizeEvent(self, event):
+        # Adjust table row height and font size proportionally when the page is resized
+        try:
+            total_h = max(300, self.height())
+            rows = max(1, max(1, self.detail_table.rowCount()))
+            # Reserve some space for controls; use remaining height for rows
+            reserved = 220
+            avail = max(100, total_h - reserved)
+            # Ensure rows are comfortably tall for larger text
+            row_h = max(36, int(avail / (rows + 0.5)))
+            self.detail_table.verticalHeader().setDefaultSectionSize(row_h)
+
+            # Compute header height (fallback if not yet shown)
+            header_h = self.detail_table.horizontalHeader().height() or 36
+            desired_h = header_h + rows * row_h + 8
+
+            # Force table to expand to fit content and avoid scrollbars
+            self.detail_table.setMinimumHeight(desired_h)
+            self.detail_table.setMaximumHeight(desired_h)
+            self.detail_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            self.detail_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self.detail_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+            # Scale font size with row height and make it bold for readability
+            font = self.detail_table.font()
+            font.setPointSize(max(12, int(row_h / 2)))
+            font.setBold(True)
+            self.detail_table.setFont(font)
+
+            header_font = self.detail_table.horizontalHeader().font()
+            header_font.setPointSize(max(13, int(row_h / 2.2)))
+            header_font.setBold(True)
+            self.detail_table.horizontalHeader().setFont(header_font)
+        except Exception:
+            pass
+        return super().resizeEvent(event)
 
     def refresh(self, force=False):
         node = self.node_selector.currentText()
@@ -1423,8 +1490,6 @@ class GraphsPage(QWidget):
         super().__init__()
         self.state = state
         self.graph_popup = None
-        self.graph_ready = False
-        self._bulk_update = False
         self.state_file_map = {}
         self.state_data_cache = {}
         self.feature_columns = []
@@ -1448,7 +1513,7 @@ class GraphsPage(QWidget):
         top_layout.addWidget(self.node_selector)
 
         self.split_selector = QComboBox()
-        self.split_selector.addItems(["train", "dev"])
+        self.split_selector.addItems(["train", "dev", "train + dev"])
         self.split_selector.currentTextChanged.connect(self.refresh_data)
         top_layout.addWidget(QLabel("Split:"))
         top_layout.addWidget(self.split_selector)
@@ -1461,30 +1526,6 @@ class GraphsPage(QWidget):
 
         top_layout.addStretch(1)
         self.layout.addWidget(top_widget)
-
-        controls_widget = QFrame()
-        controls_widget.setObjectName("StatCard")
-        controls_layout = QHBoxLayout(controls_widget)
-
-        self.channel_frame = QFrame()
-        self.channel_layout = QVBoxLayout(self.channel_frame)
-        self.channel_layout.setContentsMargins(4, 4, 4, 4)
-        self.channel_layout.setSpacing(4)
-        self.channel_frame.setFixedWidth(260)
-
-        channel_scroll = QScrollArea()
-        channel_scroll.setWidgetResizable(True)
-        channel_scroll.setWidget(self.channel_frame)
-        channel_scroll.setFixedHeight(300)
-        controls_layout.addWidget(channel_scroll)
-
-        self.select_all_cb = QCheckBox("Select All Channels")
-        self.select_all_cb.setEnabled(False)
-        self.select_all_cb.stateChanged.connect(self.on_select_all)
-        self.channel_layout.addWidget(self.select_all_cb)
-
-        controls_layout.addStretch(1)
-        self.layout.addWidget(controls_widget)
 
         self.summary_text = QTextEdit()
         self.summary_text.setReadOnly(True)
@@ -1500,11 +1541,9 @@ class GraphsPage(QWidget):
             except Exception:
                 pass
         self.graph_popup = None
-        self.graph_ready = False
 
     def _on_graph_popup_closed(self):
         self.graph_popup = None
-        self.graph_ready = False
 
     def node_data_dir(self, node):
         base = self.state.config.get("csi_data_dir") if self.state.config.get("csi_data_dir") else CSI_DATA_DIR
@@ -1556,26 +1595,30 @@ class GraphsPage(QWidget):
                 cols.append(name)
         return cols
 
-    def _set_channel_widgets_enabled(self, enabled):
-        for cb in getattr(self, "channel_checkboxes", []):
-            cb.setEnabled(enabled)
-        self.select_all_cb.setEnabled(enabled and bool(self.channel_checkboxes))
+    def _selected_splits(self):
+        mode = self.split_selector.currentText()
+        if mode == "train + dev":
+            return ["train", "dev"]
+        if mode in ("train", "dev"):
+            return [mode]
+        return ["train"]
 
     def refresh_data(self, *args):
         node = self.node_selector.currentText()
-        split = self.split_selector.currentText()
+        split_mode = self.split_selector.currentText()
+        selected_splits = self._selected_splits()
         self._close_graph_popup()
 
-        self.state_file_map = {}
+        self.state_file_map = {split: {} for split in selected_splits}
         self.state_data_cache = {}
         self.feature_columns = []
-        self.state_stats = {}
+        self.state_stats = {split: {} for split in selected_splits}
 
         feature_seen = set()
-        temp_frames = {}
+        temp_frames = {split: {} for split in selected_splits}
         summary_lines = [
             f"Node: {node}",
-            f"Split: {split}",
+            f"Split mode: {split_mode}",
             "",
         ]
 
@@ -1583,54 +1626,69 @@ class GraphsPage(QWidget):
         total_usable_files = 0
         total_rows = 0
 
-        for state in CALIB_STATES:
-            files = self.list_files_for(node, state, split)
-            self.state_file_map[state] = files
-            total_files += len(files)
+        for split in selected_splits:
+            split_total_files = 0
+            split_usable_files = 0
+            split_rows = 0
+            summary_lines.append(f"{split}:")
 
-            state_rows = 0
-            state_usable = 0
-            state_frames = []
+            for state in CALIB_STATES:
+                files = self.list_files_for(node, state, split)
+                self.state_file_map[split][state] = files
+                split_total_files += len(files)
+                total_files += len(files)
 
-            for path in files:
-                try:
-                    df = pd.read_csv(path)
-                except Exception:
-                    continue
+                state_rows = 0
+                state_usable = 0
+                state_frames = []
 
-                feature_cols = self._feature_columns_from_df(df)
-                if not feature_cols:
-                    continue
+                for path in files:
+                    try:
+                        df = pd.read_csv(path)
+                    except Exception:
+                        continue
 
-                state_rows += len(df)
-                state_usable += 1
-                total_rows += len(df)
-                frame = df[feature_cols].copy()
-                state_frames.append(frame)
-                for col in feature_cols:
-                    if col not in feature_seen:
-                        feature_seen.add(col)
-                        self.feature_columns.append(col)
+                    feature_cols = self._feature_columns_from_df(df)
+                    if not feature_cols:
+                        continue
 
-            temp_frames[state] = state_frames
-            total_usable_files += state_usable
-            self.state_stats[state] = {
-                "files": len(files),
-                "usable_files": state_usable,
-                "rows": state_rows,
-            }
+                    state_rows += len(df)
+                    state_usable += 1
+                    split_rows += len(df)
+                    total_rows += len(df)
+                    state_frames.append(df[feature_cols].copy())
+                    for col in feature_cols:
+                        if col not in feature_seen:
+                            feature_seen.add(col)
+                            self.feature_columns.append(col)
+
+                temp_frames[split][state] = state_frames
+                split_usable_files += state_usable
+                total_usable_files += state_usable
+                self.state_stats[split][state] = {
+                    "files": len(files),
+                    "usable_files": state_usable,
+                    "rows": state_rows,
+                }
+                summary_lines.append(
+                    f"  {state}: files={len(files)} usable={state_usable} rows={state_rows}"
+                )
+
             summary_lines.append(
-                f"{state}: files={len(files)} usable={state_usable} rows={state_rows}"
+                f"  total: files={split_total_files} usable={split_usable_files} rows={split_rows}"
             )
+            summary_lines.append("")
 
         self.feature_columns.sort(key=self._feature_sort_key)
 
-        for state, frames in temp_frames.items():
-            aligned_frames = [frame.reindex(columns=self.feature_columns) for frame in frames]
-            if aligned_frames:
-                self.state_data_cache[state] = pd.concat(aligned_frames, ignore_index=True)
-            else:
-                self.state_data_cache[state] = pd.DataFrame(columns=self.feature_columns)
+        for split, states in temp_frames.items():
+            self.state_data_cache[split] = {}
+            for state, frames in states.items():
+                aligned_frames = [frame.reindex(columns=self.feature_columns) for frame in frames]
+                if aligned_frames:
+                    self.state_data_cache[split][state] = pd.concat(aligned_frames, ignore_index=True)
+                else:
+                    self.state_data_cache[split][state] = pd.DataFrame(columns=self.feature_columns)
 
         summary_lines.extend([
             "",
@@ -1639,40 +1697,11 @@ class GraphsPage(QWidget):
             f"Usable files: {total_usable_files}",
             f"Total rows loaded: {total_rows}",
             "",
-            "Click Show Graph to open the popup comparison.",
+            "All SC channels are selected automatically for the comparison graph.",
         ])
 
         self.summary_text.setPlainText("\n".join(summary_lines))
-
-        self.channel_layout_parent_clear()
-        self.channel_checkboxes = []
-        for col in self.feature_columns:
-            cb = QCheckBox(col)
-            cb.setChecked(True)
-            cb.setEnabled(False)
-            cb.stateChanged.connect(self.on_channel_toggle)
-            self.channel_layout.addWidget(cb)
-            self.channel_checkboxes.append(cb)
-
-        self.select_all_cb.setEnabled(False)
-        self.select_all_cb.setChecked(bool(self.channel_checkboxes))
         self.show_graph_btn.setEnabled(bool(self.feature_columns))
-
-    def channel_layout_parent_clear(self):
-        for i in reversed(range(self.channel_layout.count())):
-            item = self.channel_layout.takeAt(i)
-            if item is None:
-                continue
-            w = item.widget()
-            if w is self.select_all_cb:
-                continue
-            if w:
-                w.setParent(None)
-                w.deleteLater()
-        self.channel_layout.insertWidget(0, self.select_all_cb)
-
-    def _selected_channels(self):
-        return [cb.text() for cb in getattr(self, "channel_checkboxes", []) if cb.isChecked()]
 
     def _state_display_name(self, state):
         return {
@@ -1681,17 +1710,19 @@ class GraphsPage(QWidget):
             "person_standing": "Person Standing",
         }.get(state, state)
 
-    def _render_graph(self, selected_channels):
+    def _render_graph(self):
         if self.graph_popup is None:
             self.graph_popup = GraphPopupWindow(on_close=self._on_graph_popup_closed)
 
+        split_mode = self.split_selector.currentText()
         self.graph_popup.setWindowTitle(
-            f"CSI Signature Comparison ({self.node_selector.currentText()}, {self.split_selector.currentText()} split)"
+            f"CSI Signature Comparison ({self.node_selector.currentText()}, {split_mode})"
         )
         self.graph_popup.render_comparison(
             node=self.node_selector.currentText(),
-            split=self.split_selector.currentText(),
-            selected_channels=selected_channels,
+            split_mode=split_mode,
+            active_splits=self._selected_splits(),
+            selected_channels=self.feature_columns,
             state_data_cache=self.state_data_cache,
             state_display_name=self._state_display_name,
         )
@@ -1703,72 +1734,30 @@ class GraphsPage(QWidget):
         if not self.feature_columns:
             QMessageBox.information(self, "No Data", "No CSI channels were found for this rack/split.")
             return
-        selected = self._selected_channels()
-        if not selected:
-            QMessageBox.information(self, "No Channels", "Select at least one channel to plot.")
-            return
-
-        self._render_graph(selected)
-        for cb in getattr(self, "channel_checkboxes", []):
-            cb.setEnabled(True)
-        self.select_all_cb.setEnabled(True if self.channel_checkboxes else False)
-        all_checked = all(cb.isChecked() for cb in self.channel_checkboxes) if self.channel_checkboxes else False
-        blocker = QSignalBlocker(self.select_all_cb)
-        self.select_all_cb.setChecked(all_checked)
-        del blocker
-        self.graph_ready = True
-
-    def on_channel_toggle(self, *_):
-        if self._bulk_update or not self.graph_ready:
-            return
-        selected = self._selected_channels()
-        if not selected:
-            if self.graph_popup is not None:
-                self.graph_popup.clear_message("No channels selected")
-            return
-        self._render_graph(selected)
-        if self.channel_checkboxes:
-            all_checked = all(cb.isChecked() for cb in self.channel_checkboxes)
-            blocker = QSignalBlocker(self.select_all_cb)
-            self.select_all_cb.setChecked(all_checked)
-            del blocker
-
-    def on_select_all(self, state):
-        if not self.channel_checkboxes:
-            return
-        check = int(state) == Qt.CheckState.Checked.value
-        self._bulk_update = True
-        try:
-            for cb in self.channel_checkboxes:
-                cb.setChecked(check)
-        finally:
-            self._bulk_update = False
-        if self.graph_ready:
-            self.on_channel_toggle()
+        self._render_graph()
 
     def refresh(self):
         node = self.node_selector.currentText()
-        split = self.split_selector.currentText()
+        split_mode = self.split_selector.currentText()
         if not node:
             self.summary_text.setPlainText("No node selected")
             return
         if not self.feature_columns:
-            self.summary_text.setPlainText(f"No CSI data available for {node} ({split} split)")
+            self.summary_text.setPlainText(f"No CSI data available for {node} ({split_mode})")
             return
-        lines = [
-            f"Node: {node}",
-            f"Split: {split}",
-            "",
-        ]
-        for state in CALIB_STATES:
-            info = self.state_stats.get(state, {})
-            lines.append(
-                f"{state}: files={info.get('files', 0)} usable={info.get('usable_files', 0)} rows={info.get('rows', 0)}"
-            )
+
+        lines = [f"Node: {node}", f"Split mode: {split_mode}", ""]
+        for split in self._selected_splits():
+            lines.append(f"{split}:")
+            for state in CALIB_STATES:
+                info = self.state_stats.get(split, {}).get(state, {})
+                lines.append(
+                    f"  {state}: files={info.get('files', 0)} usable={info.get('usable_files', 0)} rows={info.get('rows', 0)}"
+                )
+            lines.append("")
         lines.extend([
             "",
             f"Feature channels: {len(self.feature_columns)}",
-            f"Selected channels: {sum(1 for cb in self.channel_checkboxes if cb.isChecked()) if self.channel_checkboxes else 0}",
             "",
             "Click Show Graph to open the popup comparison.",
         ])
@@ -1799,7 +1788,7 @@ class GraphPopupWindow(QMainWindow):
         ax.set_axis_off()
         self.canvas.draw()
 
-    def render_comparison(self, node, split, selected_channels, state_data_cache, state_display_name):
+    def render_comparison(self, node, split_mode, active_splits, selected_channels, state_data_cache, state_display_name):
         fig = self.figure
         fig.clear()
         ax = fig.add_subplot(111)
@@ -1814,36 +1803,38 @@ class GraphPopupWindow(QMainWindow):
             "door_open": "#2e7d32",
             "person_standing": "#212121",
         }
-        linestyles = {
-            "door_closed": "-",
-            "door_open": "-",
-            "person_standing": "--",
+        split_styles = {
+            "train": "-",
+            "dev": "--",
         }
 
         plotted_any = False
-        for state in CALIB_STATES:
-            df = state_data_cache.get(state)
-            if df is None or df.empty:
-                continue
-            aligned = df.reindex(columns=selected_channels)
-            series = aligned.mean(axis=0)
-            if series.isna().all():
-                continue
-            ax.plot(
-                x,
-                series.values,
-                label=f"{split.title()}: {state_display_name(state)}",
-                color=colors.get(state, "#1976d2"),
-                linestyle=linestyles.get(state, "-"),
-                linewidth=2,
-            )
-            plotted_any = True
+        for split in active_splits:
+            split_cache = state_data_cache.get(split, {})
+            for state in CALIB_STATES:
+                df = split_cache.get(state)
+                if df is None or df.empty:
+                    continue
+                aligned = df.reindex(columns=selected_channels)
+                series = aligned.mean(axis=0)
+                if series.isna().all():
+                    continue
+                ax.plot(
+                    x,
+                    series.values,
+                    label=f"{split.title()}: {state_display_name(state)}",
+                    color=colors.get(state, "#1976d2"),
+                    linestyle=split_styles.get(split, "-"),
+                    linewidth=2,
+                    alpha=0.95 if split == "train" else 0.85,
+                )
+                plotted_any = True
 
         if not plotted_any:
             self.clear_message("No matching CSI data found for the selected channels")
             return
 
-        ax.set_title(f"CSI Signature Comparison ({node}, {split} split)")
+        ax.set_title(f"CSI Signature Comparison ({node}, {split_mode})")
         ax.set_xlabel("CSI feature channels")
         ax.set_ylabel("Mean signal")
         ax.set_xticks(x)
