@@ -1,0 +1,133 @@
+MODULE: new PHASE: import
+  wall_time_s: 12.835656
+  rss_before: 26886144 rss_after: 631078912 change: 604192768
+  timeline: /home/iankoh/inf2009_proj/profiling/new_import_timeline.html
+  top tracemalloc traces:
+    +71950779 bytes (623679 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:308
+    +36658109 bytes (400496 objs) /usr/lib/python3.13/linecache.py:172
+    +26206274 bytes (181818 objs) <frozen importlib._bootstrap_external>:784
+    +5918362 bytes (43732 objs) <frozen importlib._bootstrap>:488
+    +885148 bytes (11647 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:312
+    +747424 bytes (11637 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/profiler.py:290
+    +651616 bytes (11636 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:291
+    +561507 bytes (1473 objs) /usr/lib/python3.13/enum.py:568
+    +457604 bytes (1460 objs) <frozen abc>:106
+    +425142 bytes (5028 objs) /home/iankoh/inf2009_proj/dashboard.py:14
+    +402102 bytes (116 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/matplotlib/_docstring.py:124
+    +381018 bytes (3427 objs) <frozen abc>:123
+    +379008 bytes (768 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:313
+    +377792 bytes (1845 objs) /usr/lib/python3.13/enum.py:266
+    +374608 bytes (5542 objs) /usr/lib/python3.13/inspect.py:3087
+    +370144 bytes (2152 objs) /usr/lib/python3.13/enum.py:274
+    +279456 bytes (11644 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:196
+    +274110 bytes (348 objs) /usr/lib/python3.13/inspect.py:916
+    +257374 bytes (48 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/matplotlib/__init__.py:1447
+    +246496 bytes (6328 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/matplotlib/colors.py:1155
+
+MODULE: legacy PHASE: import
+  wall_time_s: 0.381936
+  rss_before: 551092224 rss_after: 553828352 change: 2736128
+  timeline: /home/iankoh/inf2009_proj/profiling/legacy_import_timeline.html
+  top tracemalloc traces:
+    +2052945 bytes (17722 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:308
+    +1773962 bytes (17040 objs) /usr/lib/python3.13/linecache.py:172
+    +1717309 bytes (11913 objs) <frozen importlib._bootstrap_external>:784
+    +51904 bytes (1 objs) <frozen importlib._bootstrap>:928
+    +27044 bytes (356 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:312
+    +20699 bytes (137 objs) <frozen importlib._bootstrap_external>:133
+    +20566 bytes (372 objs) /usr/lib/python3.13/json/decoder.py:361
+    +17080 bytes (305 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:291
+    +14769 bytes (121 objs) <frozen importlib._bootstrap>:488
+    +12728 bytes (74 objs) /usr/lib/python3.13/enum.py:1888
+    +12184 bytes (32 objs) /usr/lib/python3.13/typing.py:429
+    +9424 bytes (62 objs) <frozen importlib._bootstrap_external>:869
+    +8643 bytes (9 objs) /usr/lib/python3.13/tkinter/__init__.py:674
+    +8589 bytes (136 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:300
+    +8496 bytes (354 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:196
+    +8104 bytes (119 objs) <frozen importlib._bootstrap>:49
+    +7696 bytes (2 objs) /usr/lib/python3.13/tkinter/__init__.py:4982
+    +7120 bytes (19 objs) <frozen importlib._bootstrap_external>:1687
+    +6496 bytes (14 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:313
+    +6308 bytes (22 objs) <frozen abc>:106
+
+MODULE: new PHASE: init
+  wall_time_s: 0.553194
+  rss_before: 555073536 rss_after: 571015168 change: 15941632
+  timeline: /home/iankoh/inf2009_proj/profiling/new_init_timeline.html
+  top tracemalloc traces:
+    +865695 bytes (6667 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:308
+    +179424 bytes (6 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/internals/managers.py:2491
+    +179296 bytes (2 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/internals/concat.py:133
+    +60888 bytes (354 objs) /usr/lib/python3.13/enum.py:274
+    +37076 bytes (488 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:312
+    +23520 bytes (420 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:291
+    +20344 bytes (253 objs) <frozen abc>:123
+    +16617 bytes (248 objs) /home/iankoh/inf2009_proj/tools/full_report_dashboards.py:161
+    +14912 bytes (86 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:313
+    +12992 bytes (1 objs) /usr/lib/python3.13/enum.py:840
+    +11664 bytes (486 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:196
+    +11328 bytes (177 objs) /usr/lib/python3.13/enum.py:268
+    +10560 bytes (264 objs) /usr/lib/python3.13/json/encoder.py:257
+    +10200 bytes (85 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/internals/managers.py:442
+    +9240 bytes (1 objs) /usr/lib/python3.13/enum.py:330
+    +7464 bytes (112 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:300
+    +6519 bytes (60 objs) /home/iankoh/inf2009_proj/dashboard.py:807
+    +6512 bytes (1 objs) /usr/lib/python3.13/enum.py:1104
+    +5280 bytes (21 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/profiler.py:290
+    +4480 bytes (25 objs) /usr/lib/python3.13/json/encoder.py:334
+
+MODULE: legacy PHASE: init
+  wall_time_s: 2.337442
+  rss_before: 571015168 rss_after: 554024960 change: -16990208
+  timeline: /home/iankoh/inf2009_proj/profiling/legacy_init_timeline.html
+  top tracemalloc traces:
+    +4053315 bytes (27827 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:308
+    +124952 bytes (1646 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:312
+    +85232 bytes (1522 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:291
+    +85032 bytes (1264 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/profiler.py:290
+    +72920 bytes (123 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/customtkinter/windows/widgets/ctk_label.py:89
+    +64608 bytes (584 objs) /usr/lib/python3.13/tkinter/__init__.py:119
+    +41965 bytes (326 objs) /usr/lib/python3.13/tkinter/__init__.py:2759
+    +41957 bytes (650 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:300
+    +36984 bytes (1541 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:196
+    +34848 bytes (44 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/customtkinter/windows/widgets/ctk_button.py:75
+    +33792 bytes (63 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/customtkinter/windows/widgets/core_rendering/ctk_canvas.py:79
+    +26568 bytes (123 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/customtkinter/windows/widgets/core_rendering/ctk_canvas.py:32
+    +25344 bytes (131 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:313
+    +22656 bytes (472 objs) /usr/lib/python3.13/tkinter/__init__.py:1611
+    +19264 bytes (301 objs) /usr/lib/python3.13/tkinter/__init__.py:2760
+    +13638 bytes (273 objs) /usr/lib/python3.13/tkinter/__init__.py:2752
+    +13365 bytes (273 objs) /usr/lib/python3.13/tkinter/__init__.py:2744
+    +13312 bytes (208 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/customtkinter/windows/widgets/core_rendering/ctk_canvas.py:87
+    +10696 bytes (17 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/customtkinter/windows/widgets/ctk_entry.py:71
+    +10176 bytes (15 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/customtkinter/windows/widgets/ctk_scrollbar.py:67
+
+MODULE: new PHASE: dataset_summary
+  wall_time_s: 0.198046
+  rss_before: 554024960 rss_after: 554024960 change: 0
+  timeline: /home/iankoh/inf2009_proj/profiling/new_dataset_summary_timeline.html
+  top tracemalloc traces:
+    +290118 bytes (2044 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:308
+    +13604 bytes (179 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:312
+    +7616 bytes (136 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:291
+    +4248 bytes (177 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:196
+    +2800 bytes (50 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/internals/blocks.py:2255
+    +2752 bytes (24 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:313
+    +2363 bytes (37 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/stack_sampler.py:300
+    +2160 bytes (30 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/internals/managers.py:2430
+    +1992 bytes (8 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/profiler.py:290
+    +1092 bytes (24 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/io/parsers/c_parser_wrapper.py:95
+    +1080 bytes (9 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/io/common.py:788
+    +936 bytes (7 objs) /home/iankoh/inf2009_proj/dashboard.py:525
+    +720 bytes (11 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/io/common.py:926
+    +600 bytes (12 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/core/algorithms.py:1492
+    +488 bytes (5 objs) /home/iankoh/inf2009_proj/dashboard.py:400
+    +448 bytes (7 objs) shibokensupport/signature/loader.py:63
+    +392 bytes (10 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pandas/io/parsers/c_parser_wrapper.py:215
+    +376 bytes (1 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/profiler.py:138
+    +360 bytes (2 objs) /home/iankoh/inf2009_proj/inf2009_venv/lib/python3.13/site-packages/pyinstrument/profiler.py:193
+    +312 bytes (4 objs) /home/iankoh/inf2009_proj/dashboard.py:531
+
+MODULE: legacy PHASE: dataset_summary
+  ERROR: RuntimeError('no build_dataset_summary')
+
