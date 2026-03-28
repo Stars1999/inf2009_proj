@@ -55,7 +55,10 @@ def _import_tfmot():
         return importlib.import_module("tensorflow_model_optimization")
     except Exception as exc:
         raise RuntimeError(
-            "TensorFlow Model Optimization Toolkit import failed. Install tensorflow-model-optimization."
+            "TensorFlow Model Optimization Toolkit import failed. If you need pruning/quantization, install it in this environment:\n"
+            "    pip install tensorflow-model-optimization tf_keras\n"
+            "or create a separate venv and run:\n"
+            "    pip install -r requirements-tfmot.txt"
         ) from exc
 
 

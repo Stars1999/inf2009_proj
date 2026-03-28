@@ -5,6 +5,10 @@
 # pip install -r requirements-tfmot.txt
 
 tensorflow-model-optimization==0.8.0
+# tf_keras provides legacy tf.keras compatibility sometimes required by tfmot
+# Pin to the matching TensorFlow minor version
+tf_keras==2.21.0
+
 
 # Optionally, if tfmot import complains about legacy Keras, try installing the compatibility package:
 # tf_keras
