@@ -1,75 +1,117 @@
 # inf2009_proj
 
-Pi-side services for CSI collection, model training, and ESP32 model delivery.
+Pi-side services for CSI collection, calibration, training, and ESP32 model delivery.
 
-For report-grade profiling and PASO methodology, see `TECHNICAL_REFERENCE.md`.
+This repository works together with `edge-esp32`:
 
-## Setup (UV packaging)
+- the ESP32 firmware captures CSI and uploads sub-batches over HTTP
+- this repo receives and merges the data, manages calibration, trains models, and publishes model-load commands
 
-This project now supports PEP 621/`pyproject.toml` packaging with optional UV tooling.
+For profiling notes and PASO methodology, see `TECHNICAL_REFERENCE.md`.
 
-### Option A: standard package install
+## What’s in here
+
+| File / folder | Purpose |
+| --- | --- |
+| `server.py` | Flask ingest server and MQTT bridge for CSI uploads |
+| `dashboard.py` | Desktop dashboard for calibration, node status, and model workflow |
+| `launch.sh` | Helper launcher for `server.py`, `dashboard.py`, and `broadcast_generator.py` |
+| `train_improved_grouped_model.py` | Portable grouped-feature training pipeline |
+| `edge_ml.py` | TensorFlow-based training/export pipeline |
+| `export_model_for_esp32.py` | Utility for aligning and exporting model artifacts for ESP32 use |
+| `push_model.py` | Copies model artifacts into `model_store/<NODE>/` and can trigger a load |
+| `broadcast_generator.py` | Optional UDP traffic helper for testing CSI capture |
+| `reset_helpers.py` | Removes node data/model artifacts and can trigger cleanup actions |
+| `shared_config.py` | Shared constants for CSI geometry, feature windowing, and defaults |
+| `csi_data/` | Collected CSI CSVs, organized by node and label |
+| `model_store/` | Per-node active model artifacts plus backups |
+| `profiling/` | PASO and performance profiling outputs |
+| `calib_states.json`, `config.json`, `keys.json`, `view_state.json`, `heartbeat_state.json` | Runtime state persisted by the dashboard and scripts |
+
+## Setup
+
+### Prerequisites
+
+- Python 3.9+
+- Raspberry Pi OS or another Linux environment
+- Mosquitto broker
+
+### Create a Python environment
 
 ```bash
 cd inf2009_proj
 python3 -m venv inf2009_venv
 source inf2009_venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install .
+python -m pip install --no-deps -r requirements.txt
 ```
 
-### Option B: using UV packaging helper
+If you prefer the packaged install, `python -m pip install .` also works in supported environments.
 
-```bash
-cd inf2009_proj
-python3 -m venv inf2009_venv
-source inf2009_venv/bin/activate
-python -m pip install --upgrade pip
-pip install uv
-uv install
-```
+### Configure environment variables
 
-### Legacy requirements file
-
-If you need strict pinned dependencies in this repo (for reproducibility):
-
-```bash
-pip install --no-deps -r requirements.txt
-```
-
-Copy environment variables:
+Copy the template and fill in the values that match your Pi and broker:
 
 ```bash
 cp .env.example .env
 ```
 
-## Run
+At minimum, check these values in `.env`:
 
-Start in separate terminals:
+- `MQTT_BROKER`
+- `MQTT_PORT`
+- `SERVER_HOST`
+- `SERVER_PORT`
+- `MODEL_STORE_DIR`
+- `CSI_DATA_DIR`
+
+## How to run
+
+### Start the main services
+
+Open separate terminals and run:
 
 ```bash
-python server.py
-python dashboard.py
+cd inf2009_proj
+source venv/bin/activate # if you created a virtual environment
+python ./launch.sh # starts server and dashboard
 ```
 
-Optional UDP broadcaster:
+### Optional helper
 
 ```bash
 python broadcast_generator.py
 ```
 
-One-command launcher (interactive terminals or headless):
+### One-command launcher
+
+`launch.sh` can start the services interactively or in the background:
 
 ```bash
 ./launch.sh
 ./launch.sh --headless
+./launch.sh --headless --components server,dashboard
 ./launch.sh --status
-./launch.sh --stop
+./launch.sh --stop --components server,dashboard
 ```
 
-## Train model
+In headless mode, logs go to `mqtt_logs/` and PID files go to `.run/`.
 
-`dashboard.py` invokes `edge_ml.py` after calibration, or run manually:
+## How to use the project
+
+### 1. Collect calibration data
+
+Use the dashboard to mark calibration states such as `door_closed`, `door_open`, and `person_standing`, then trigger collection from the ESP32 side.
+
+### 2. Train a model
+
+For the portable grouped pipeline:
+
+```bash
+python train_improved_grouped_model.py
+```
+
+For the notebook-derived TensorFlow flow:
 
 ```bash
 python edge_ml.py \
@@ -79,51 +121,31 @@ python edge_ml.py \
   --scaler-output model_store/_tmp/RACK_1/scaler_params.json
 ```
 
-Push model to ESP32:
+### 3. Push the model to a node
 
 ```bash
 python push_model.py model_store/RACK_1/model.tflite --node RACK_1 --load
 ```
 
-## Core MQTT topics
+You can also provide a custom scaler file with `--params`.
 
-- `/commands/<node>/collect`
-- `/commands/<node>/training_complete`
-- `/commands/<node>/load_model`
-- `/sensors/<node>/status`
-- `/sensors/<node>/perf_bin`
-- `device/<node>/status`
+### 4. Manage or reset node data
 
-## Node presence and liveliness model (dashboard)
+```bash
+python reset_helpers.py RACK_1
+```
 
-- Dashboard now derives node presence from both `device/<node>/status` and `/sensors/<node>/status` heartbeat events.
-- Presence states:
-  - `ONLINE`: explicit online + fresh heartbeat
-  - `STALE`: explicit online but heartbeat timed out (fallback safety state)
-  - `OFFLINE`: explicit offline or never seen
-- Liveliness defaults:
-  - heartbeat timeout: `90s`
-  - liveliness check interval: `30s`
-- Dashboard persists heartbeat timestamps in `heartbeat_state.json` (local runtime file, gitignored) to avoid ghost online state after restarts.
-
-## Profiling (before vs after, non-destructive)
-
-Run baseline-vs-current profiling without reverting your working tree:
+### 5. Inspect profiling output
 
 ```bash
 profiling/scripts/run_worktree_compare.sh <baseline_commit>
 ```
 
-Outputs in `profiling/results/`:
+## Things to note
 
-- `before_baseline.json`, `after_optimized.json`
-- `perf_before.csv`, `perf_after.csv`
-- `summary_table.csv`, `summary_table.md`
-- `runbook.md`
-
-Method/workload lock files:
-
-- `profiling/scripts/profile_matrix.json`
-- `profiling/scripts/workload_lock.json`
-
-For firmware-specific instructions, see `edge-esp32/README.md`.
+- MQTT topic names must stay in sync with `edge-esp32`, especially `/commands/<node>/collect`, `/commands/<node>/training_complete`, `/commands/<node>/load_model`, and `/sensors/<node>/status`.
+- The current training path uses the grouped feature layout: 8 averaged CSI groups plus `AVG_VARIATION`.
+- `model_store/<NODE>/` contains the active artifacts; `model_store/_tmp/` is for temporary training output.
+- `heartbeat_state.json` is a local runtime file used by the dashboard to avoid stale online/offline state.
+- TensorFlow is optional; if it is unavailable, use `train_improved_grouped_model.py`.
+- For firmware build and flash steps, see `edge-esp32/README.md`.

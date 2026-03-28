@@ -27,3 +27,4 @@ profiling/results/*.md
 # OS files
 .DS_Store
 Thumbs.db
+inf2009_pyenv_venv/
