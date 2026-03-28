@@ -1084,14 +1084,14 @@ class ESPConfigPage(QWidget):
         # Make columns equal width and rows uniform
         self.detail_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.detail_table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
-        # Slightly larger default row height; will be adjusted on resize
-        self.detail_table.verticalHeader().setDefaultSectionSize(44)
         self.detail_table.verticalHeader().setVisible(False)
         self.detail_table.setWordWrap(False)
         self.detail_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        # Increase default font size for readability; will be adjusted dynamically
-        self.detail_table.setStyleSheet("QTableWidget { font-size: 14px; } QHeaderView::section { font-weight: bold; font-size: 15px; }")
-        self.detail_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # Bigger text but compact rows
+        self.detail_table.setStyleSheet("QTableWidget { font-size: 18px; padding: 0px; } QHeaderView::section { font-weight: bold; font-size: 19px; padding: 2px; }")
+        self.detail_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        self.detail_table.setMaximumHeight(270)
+        self.detail_table.setMinimumHeight(210)
         layout.addWidget(self.detail_table)
 
     def resizeEvent(self, event):
@@ -1099,20 +1099,21 @@ class ESPConfigPage(QWidget):
         # but cap the table height to a fraction of the available screen so the window
         # never grows beyond the display. Allow scrollbars when content doesn't fit.
         try:
-            total_h = max(300, self.height())
+            total_h = max(220, self.height())
             rows = max(1, self.detail_table.rowCount())
-            reserved = 220
+            reserved = 170
             avail = max(100, total_h - reserved)
-            row_h = max(36, int(avail / (rows + 0.5)))
+            row_h = max(32, int(avail / (rows + 0.25)))
+            # Force smaller rows to fit 3 rows without scrolling, while keeping bigger font.
+            row_h = min(row_h, 65)
             self.detail_table.verticalHeader().setDefaultSectionSize(row_h)
 
-            header_h = self.detail_table.horizontalHeader().height() or 36
-            desired_h = header_h + rows * row_h + 8
+            header_h = self.detail_table.horizontalHeader().height() or 34
+            desired_h = header_h + rows * row_h + 6
 
             screen = QApplication.primaryScreen()
             screen_h = screen.availableGeometry().height() if screen is not None else total_h
-            # Allow the table to take up at most 50% of the screen height (adjustable)
-            max_table_h = min(desired_h, max(120, int(screen_h * 0.5)))
+            max_table_h = min(desired_h, max(120, int(screen_h * 0.35)))
 
             # Let the table grow up to max_table_h and enable scrollbars when necessary
             self.detail_table.setMinimumHeight(min(desired_h, max_table_h))
@@ -1166,7 +1167,15 @@ class ESPConfigPage(QWidget):
         else:
             model_text = "No model loaded"
 
-        base_text = f"Node: {node} | Status: {status.upper()} | Current State: {self.state.node_detected_state.get(node, 'unknown')} | {model_text}"
+        last_hb = self.state.node_last_heartbeat.get(node, 0)
+        if last_hb and self.state.node_online.get(node, False):
+            last_seen = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_hb))
+        elif last_hb:
+            last_seen = f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_hb))} (stale)"
+        else:
+            last_seen = "never"
+
+        base_text = f"Node: {node} | Status: {status.upper()} | Last seen: {last_seen} | Current State: {self.state.node_detected_state.get(node, 'unknown')} | {model_text}"
         cur, total = self.state.collection_progress.get(node, (0, 0))
         ready_from_progress = total > 0 and cur >= total
         collecting = bool(self.state.collection_in_progress.get(node, False))
