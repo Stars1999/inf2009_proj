@@ -863,7 +863,7 @@ def upload_data():
     return "OK", 200
 
 
-def start_server(host=os.getenv("SERVER_HOST", "0.0.0.0"), port=int(os.getenv("SERVER_PORT", "6000"))):
+def start_server(host=os.getenv("SERVER_HOST", "0.0.0.0"), port=int(os.getenv("SERVER_PORT", "5000"))):
     # Ensure the background cleanup thread is running before we start serving.
     _start_cleanup_thread()
 

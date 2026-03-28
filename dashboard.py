@@ -10,6 +10,13 @@ import queue
 import shutil
 from pathlib import Path
 
+# Enable faulthandler to help surface C-level crashes (segfault tracebacks) during debugging
+try:
+    import faulthandler
+    faulthandler.enable()
+except Exception:
+    pass
+
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
 from PySide6.QtWidgets import (
     QApplication,
@@ -40,8 +47,9 @@ from PySide6.QtWidgets import (
 
 import pandas as pd
 import paho.mqtt.client as mqtt
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
+# Matplotlib Qt canvas is imported lazily inside GraphPopupWindow to avoid
+# initializing Qt bindings at module import time which can cause segmentation
+# faults in some environments where Qt is not yet fully set up.
 
 from shared_config import DEFAULT_MQTT_BROKER, DEFAULT_MQTT_PORT
 
@@ -325,19 +333,23 @@ class MqttClient(threading.Thread):
 
     def on_message(self, client, userdata, msg):
         try:
-            topic = msg.topic
+            topic = msg.topic or ""
+            parts = topic.strip("/").split("/")
             payload = msg.payload.decode(errors="ignore").strip()
-            
-            if topic.startswith("device/") and topic.endswith("/status"):
-                node_id = topic.split("/")[1]
+
+            # device/<node>/status -> simple status updates
+            if len(parts) >= 3 and parts[0] == "device" and parts[2] == "status":
+                node_id = parts[1]
                 status = payload.lower()
                 self.state.node_online[node_id] = (status == "online")
                 if status == "online":
                     self.state.node_last_heartbeat[node_id] = time.time()
                 self._enqueue_event("node_status", node_id, status)
-            
-            elif topic.startswith("/sensors/") and topic.endswith("/status"):
-                node_id = topic.split("/")[2]
+                return
+
+            # sensors/<node>/status -> JSON body with events
+            if len(parts) >= 3 and parts[0] == "sensors" and parts[2] == "status":
+                node_id = parts[1]
                 try:
                     body = json.loads(payload)
                 except json.JSONDecodeError:
@@ -345,6 +357,7 @@ class MqttClient(threading.Thread):
                 event = body.get("event")
                 if not event:
                     return
+
                 if event == "collection_progress":
                     sub = int(body.get("sub_batch_idx", 0))
                     total = int(body.get("total_sub_batches", 1))
@@ -358,12 +371,14 @@ class MqttClient(threading.Thread):
                     label = body.get("label")
                     session = body.get("session")
                     if label in CALIB_STATES:
+                        # ensure node entry exists
+                        self.state.esp_nodes.setdefault(node_id, {s: False for s in CALIB_STATES})
                         self.state.esp_nodes[node_id][label] = True
                         self._enqueue_event("collection_complete", node_id, label, session)
                 elif event == "model_ready":
                     self.state.model_state[node_id] = True
                     self._enqueue_event("model_event", node_id, body)
-                elif event == "model_download_failed" or event == "model_download_incompatible":
+                elif event in ("model_download_failed", "model_download_incompatible"):
                     self.state.model_state[node_id] = False
                     self._enqueue_event("model_event", node_id, body)
                 elif event == "model_cleared":
@@ -372,22 +387,23 @@ class MqttClient(threading.Thread):
                 elif event == "heartbeat":
                     self.state.node_last_heartbeat[node_id] = time.time()
                 elif event == "state_change":
-                    state = body.get("state")
-                    if isinstance(state, str):
-                        self.state.node_detected_state[node_id] = state
+                    state_val = body.get("state")
+                    if isinstance(state_val, str):
+                        self.state.node_detected_state[node_id] = state_val
                 elif event == "ack":
                     cmd = body.get("cmd", "?")
                     self._enqueue_event("error", f"{node_id} acknowledged {cmd}")
                 elif event == "identify_confirmed":
                     assigned = body.get("name", node_id)
                     self._enqueue_event("error", f"{node_id} confirmed name {assigned}")
-            
-            # Color Toggle Logic - matches legacy exactly
+                return
+
+            # Legacy plain-topic key toggles
             if payload in self.state.keys:
-                if topic == "Key Unlocked":
+                if topic.strip() == "Key Unlocked":
                     self.state.keys[payload] = "out"
                     self._enqueue_event("key_status", payload, "out")
-                elif topic == "Key Returned":
+                elif topic.strip() == "Key Returned":
                     self.state.keys[payload] = "in"
                     self._enqueue_event("key_status", payload, "in")
         except Exception as e:
@@ -575,6 +591,14 @@ class DashboardMain(QMainWindow):
         super().__init__()
         self.setWindowTitle("Zero-Trust Physical Key Governance")
         self.resize(1300, 820)
+        # Cap window height to the available screen geometry to avoid growing beyond the display
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            avail_h = screen.availableGeometry().height()
+            self.setMaximumHeight(avail_h)
+            # Ensure initial height doesn't exceed screen
+            if self.height() > avail_h:
+                self.resize(self.width(), avail_h)
 
         self.state = AppState()
         self.state.load_all()
@@ -1071,29 +1095,32 @@ class ESPConfigPage(QWidget):
         layout.addWidget(self.detail_table)
 
     def resizeEvent(self, event):
-        # Adjust table row height and font size proportionally when the page is resized
+        # Adjust table row height and font size proportionally when the page is resized,
+        # but cap the table height to a fraction of the available screen so the window
+        # never grows beyond the display. Allow scrollbars when content doesn't fit.
         try:
             total_h = max(300, self.height())
-            rows = max(1, max(1, self.detail_table.rowCount()))
-            # Reserve some space for controls; use remaining height for rows
+            rows = max(1, self.detail_table.rowCount())
             reserved = 220
             avail = max(100, total_h - reserved)
-            # Ensure rows are comfortably tall for larger text
             row_h = max(36, int(avail / (rows + 0.5)))
             self.detail_table.verticalHeader().setDefaultSectionSize(row_h)
 
-            # Compute header height (fallback if not yet shown)
             header_h = self.detail_table.horizontalHeader().height() or 36
             desired_h = header_h + rows * row_h + 8
 
-            # Force table to expand to fit content and avoid scrollbars
-            self.detail_table.setMinimumHeight(desired_h)
-            self.detail_table.setMaximumHeight(desired_h)
-            self.detail_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            self.detail_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-            self.detail_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            screen = QApplication.primaryScreen()
+            screen_h = screen.availableGeometry().height() if screen is not None else total_h
+            # Allow the table to take up at most 50% of the screen height (adjustable)
+            max_table_h = min(desired_h, max(120, int(screen_h * 0.5)))
 
-            # Scale font size with row height and make it bold for readability
+            # Let the table grow up to max_table_h and enable scrollbars when necessary
+            self.detail_table.setMinimumHeight(min(desired_h, max_table_h))
+            self.detail_table.setMaximumHeight(max_table_h)
+            self.detail_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self.detail_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            self.detail_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
             font = self.detail_table.font()
             font.setPointSize(max(12, int(row_h / 2)))
             font.setBold(True)
@@ -1149,16 +1176,23 @@ class ESPConfigPage(QWidget):
         self.start_button.setEnabled(not (collecting and not ready_from_progress))
 
         if self.state.training_in_progress.get(node, False):
-            self.status_label.setText("Training in progress...")
+            status_text = "Training in progress..."
+            status_color = "#7b1fa2"
         elif collecting:
             if ready_from_progress:
-                self.status_label.setText(f"Status: Upload complete ({cur}/{total}) - waiting for server merge")
+                status_text = f"Status: Upload complete ({cur}/{total}) - waiting for server merge"
+                status_color = "#ffb300"
             elif total > 0:
-                self.status_label.setText(f"Status: Calibrating {cur}/{total} sub-batches uploaded")
+                status_text = f"Status: Calibrating {cur}/{total} sub-batches uploaded"
+                status_color = "#1976d2"
             else:
-                self.status_label.setText("Status: Calibration started")
+                status_text = "Status: Calibration started"
+                status_color = "#1976d2"
         else:
-            self.status_label.setText(base_text)
+            status_text = base_text
+            status_color = "#4caf50" if self.state.node_online.get(node) else "#d32f2f"
+        self.status_label.setText(status_text)
+        self.status_label.setStyleSheet(f"font-weight: bold; color: {status_color}; margin-top: 10px; font-size: 15px;")
 
         # Enable/disable training and load buttons appropriately
         can_train = all(self.state.esp_nodes.get(node, {}).get(s, False) for s in CALIB_STATES) and not self.state.training_in_progress.get(node, False)
@@ -1769,9 +1803,21 @@ class GraphPopupWindow(QMainWindow):
         super().__init__()
         self._on_close = on_close
         self.setAttribute(Qt.WA_DeleteOnClose, True)
-        self.figure = Figure(figsize=(11, 7))
-        self.canvas = FigureCanvas(self.figure)
-        self.setCentralWidget(self.canvas)
+        # Lazy import matplotlib backends in the GUI thread to avoid Qt initialization issues
+        self._mpl_available = False
+        try:
+            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+            from matplotlib.figure import Figure
+            self.figure = Figure(figsize=(11, 7))
+            self.canvas = FigureCanvas(self.figure)
+            self.setCentralWidget(self.canvas)
+            self._mpl_available = True
+        except Exception as _e:
+            # Fallback UI: show a simple text area when matplotlib is unavailable
+            warning = QTextEdit("Graphing unavailable: matplotlib could not be initialized.\n\n" + str(_e))
+            warning.setReadOnly(True)
+            warning.setStyleSheet("font-family: Consolas, 'Courier New', monospace; font-size: 13px; background-color: #fff3e0; color: #6b4f00; border-radius: 6px; padding: 12px;")
+            self.setCentralWidget(warning)
         self.resize(1200, 760)
 
     def closeEvent(self, event):
@@ -1781,20 +1827,39 @@ class GraphPopupWindow(QMainWindow):
         super().closeEvent(event)
 
     def clear_message(self, message):
-        fig = self.figure
-        fig.clear()
-        ax = fig.add_subplot(111)
-        ax.text(0.5, 0.5, message, ha="center", va="center", transform=ax.transAxes, fontsize=16)
-        ax.set_axis_off()
-        self.canvas.draw()
+        if getattr(self, '_mpl_available', False):
+            fig = self.figure
+            fig.clear()
+            ax = fig.add_subplot(111)
+            ax.text(0.5, 0.5, message, ha="center", va="center", transform=ax.transAxes, fontsize=16)
+            ax.set_axis_off()
+            try:
+                self.canvas.draw()
+            except Exception:
+                pass
+        else:
+            # If matplotlib isn't available, replace central widget text
+            try:
+                widget = self.centralWidget()
+                if isinstance(widget, QTextEdit):
+                    widget.setPlainText(message)
+                else:
+                    t = QTextEdit(message)
+                    t.setReadOnly(True)
+                    self.setCentralWidget(t)
+            except Exception:
+                pass
 
     def render_comparison(self, node, split_mode, active_splits, selected_channels, state_data_cache, state_display_name):
+        if not getattr(self, '_mpl_available', False):
+            self.clear_message('Matplotlib unavailable - cannot render graph')
+            return
         fig = self.figure
         fig.clear()
         ax = fig.add_subplot(111)
 
         if not selected_channels:
-            self.clear_message("No channels selected")
+            self.clear_message('No channels selected')
             return
 
         x = list(range(len(selected_channels)))
@@ -1920,6 +1985,9 @@ class LogsPage(QWidget):
         self.text_area = QTextEdit()
         self.text_area.setReadOnly(True)
         self.text_area.setStyleSheet("font-family: Consolas, 'Courier New', monospace; font-size: 13px; background-color: #2b2b2b; color: #a9b7c6; border-radius: 6px;")
+        self.text_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.text_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.text_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.layout.addWidget(self.text_area)
 
     def append_log(self, message):
