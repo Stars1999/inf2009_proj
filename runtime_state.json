@@ -1,0 +1,44 @@
+{
+  "expected_calib": {},
+  "expected_session": {},
+  "collection_campaign": {},
+  "collection_run_counter": {},
+  "collection_in_progress": {
+    "RACK_1": false,
+    "RACK_2": false,
+    "RACK_3": false,
+    "RACK_4": false
+  },
+  "collection_progress": {
+    "RACK_1": [
+      0,
+      0
+    ],
+    "RACK_2": [
+      0,
+      0
+    ],
+    "RACK_3": [
+      0,
+      0
+    ],
+    "RACK_4": [
+      0,
+      0
+    ]
+  },
+  "last_calib_choice": {},
+  "last_split_choice": {},
+  "training_in_progress": {
+    "RACK_1": false,
+    "RACK_2": false,
+    "RACK_3": false,
+    "RACK_4": false
+  },
+  "node_detected_state": {
+    "RACK_1": "unknown",
+    "RACK_2": "unknown",
+    "RACK_3": "unknown",
+    "RACK_4": "unknown"
+  }
+}

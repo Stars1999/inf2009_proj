@@ -35,7 +35,7 @@ app = Flask(__name__)
 load_dotenv()
 
 # --- CONFIGURATION (Must match ESP32 exactly) ---
-# Note: BATCH_SIZE is only for validation of the FULL batch. 
+# Note: BATCH_SIZE is only for validation of the FULL batch.
 # On server, we care about SUB_BATCH_SIZE (e.g., 40)
 SUB_BATCH_SIZE = DEFAULT_SUB_BATCH_SIZE
 # make directories relative to this script so moving repo won't break paths
@@ -66,6 +66,7 @@ def _normalize_split(split_group: str | None) -> str:
         return s
     return "train"
 active_sessions = {}
+_aborted_sessions: dict[str, dict[str, float]] = {}
 # The idempotency cache is used to detect retries of the same logical upload.
 # It grows with every new (session, sub-batch) combination until the cleanup
 # thread evicts old entries. In a typical deployment this should remain small
@@ -84,6 +85,9 @@ IDEMPOTENCY_TTL_SECONDS = 600  # 10 minutes
 # used while a multi-part upload is being collected.
 SESSION_DIR_TTL_SECONDS = 600  # 10 minutes
 SESSION_CLEANUP_INTERVAL_SECONDS = 300  # run cleanup every 5 minutes
+WATCHDOG_TIMEOUT_SECONDS = 30
+WATCHDOG_CHECK_INTERVAL_SECONDS = 5
+ABORTED_SESSION_TTL_SECONDS = 600
 FINALIZE_MERGE_CHUNK_SIZE = int(os.getenv("FINALIZE_MERGE_CHUNK_SIZE", "5000"))
 
 # PASO phase constants and toggles
@@ -104,9 +108,17 @@ def _json_load(path: str, default):
 
 def _json_save(path: str, payload) -> None:
     tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as fp:
-        json.dump(payload, fp, indent=2, sort_keys=True)
-    os.replace(tmp_path, path)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fp:
+            json.dump(payload, fp, indent=2, sort_keys=True)
+        os.replace(tmp_path, path)
+    except Exception as e:
+        print(f"[STATE] Failed to save {path}: {e}")
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
 
 
 def _safe_slug(value: str, fallback: str = "unknown") -> str:
@@ -117,6 +129,94 @@ def _safe_slug(value: str, fallback: str = "unknown") -> str:
 
 def _session_manifest_path(session_dir: str) -> str:
     return os.path.join(session_dir, "session_manifest.json")
+
+
+def _publish_collection_stopped_event(esp32_id: str, label: str | None, session_id: str | None, reason: str) -> None:
+    if not esp32_id or mqtt_client is None:
+        return
+
+    payload = {
+        "event": "collection_stopped",
+        "reason": reason,
+        "source": "server",
+        "node": esp32_id,
+    }
+    if label:
+        payload["label"] = label
+    if session_id:
+        payload["session"] = session_id
+
+    try:
+        mqtt_client.publish(f"/sensors/{esp32_id}/status", json.dumps(payload), qos=1)
+    except Exception as e:
+        print(f"[CONTROL] Failed to publish collection_stopped event for {esp32_id}: {e}")
+
+
+def cleanup_interrupted_session(esp32_id: str, reason: str = "interrupted") -> None:
+    """
+    Clean up partial data when a node goes offline during collection.
+    Removes all part_*.csv files and session_manifest.json for the active session.
+    """
+    with _active_sessions_lock:
+        session_info = active_sessions.get(esp32_id)
+        if not session_info:
+            return
+
+        label = session_info.get("label")
+        session_id = session_info.get("session")
+        campaign_id = session_info.get("campaign_id")
+
+        if session_id:
+            _aborted_sessions.setdefault(esp32_id, {})[str(session_id)] = time.time()
+
+        # Remove from active sessions
+        active_sessions.pop(esp32_id, None)
+
+    if not all([label, session_id, campaign_id]):
+        print(f"[CLEANUP] Aborted session for {esp32_id} due to {reason} (incomplete metadata)")
+        _publish_collection_stopped_event(esp32_id, label, session_id, reason)
+        return
+
+    # Build path to session directory
+    campaign_slug = _safe_slug(campaign_id, fallback=session_id)
+    run_slug = _safe_slug(session_id, fallback=session_id)
+    session_dir = os.path.join(SAVE_DIR, esp32_id, label, campaign_slug, run_slug)
+
+    if not os.path.isdir(session_dir):
+        print(f"[CLEANUP] No session directory to clean: {session_dir}")
+        _publish_collection_stopped_event(esp32_id, label, session_id, reason)
+        return
+
+    # Delete all part_*.csv files
+    part_files = glob.glob(os.path.join(session_dir, "part_*.csv"))
+    deleted_count = 0
+    for part_file in part_files:
+        try:
+            os.remove(part_file)
+            deleted_count += 1
+        except Exception as e:
+            print(f"[CLEANUP ERROR] Failed to delete {part_file}: {e}")
+
+    # Delete session manifest
+    manifest_path = _session_manifest_path(session_dir)
+    if os.path.isfile(manifest_path):
+        try:
+            os.remove(manifest_path)
+            deleted_count += 1
+        except Exception as e:
+            print(f"[CLEANUP ERROR] Failed to delete manifest {manifest_path}: {e}")
+
+    # Try to remove the empty directory
+    try:
+        if not os.listdir(session_dir):
+            os.rmdir(session_dir)
+    except Exception:
+        pass
+
+    _publish_collection_stopped_event(esp32_id, label, session_id, reason)
+
+    print(f"[CLEANUP] Cleaned up interrupted session for {esp32_id} due to {reason}: "
+          f"removed {deleted_count} files from {session_dir}")
 
 
 def _final_manifest_path(esp32_id: str, room_state: str, split_group: str, campaign_id: str, run_id: str, timestamp: str) -> str:
@@ -194,10 +294,11 @@ def _update_session_manifest(
 def on_mqtt_connect(client, userdata, flags, rc):
     if rc == 0:
         client.subscribe("/commands/+/collect")
+        client.subscribe("/commands/+/stop_collect")
         client.subscribe("/sensors/+/status")
         client.subscribe("/sensors/+/perf_bin")
         client.subscribe("device/+/status")
-        print("MQTT connected. Listening on /commands/+/collect")
+        print("MQTT connected. Listening on /commands/+/collect and /commands/+/stop_collect")
     else:
         print(f"MQTT connection failed: {rc}")
 
@@ -239,7 +340,7 @@ def on_mqtt_message(client, userdata, message):
         if version != 1:
             print(f"[PASO PERF] node={node_id} unsupported version={version}")
             return
-            
+
         if payload_size != PERF_BIN_STRUCT.size:
             print(f"[PASO PERF] node={node_id} payload_size mismatch header={payload_size} expected={PERF_BIN_STRUCT.size}")
 
@@ -269,9 +370,40 @@ def on_mqtt_message(client, userdata, message):
             print(f"\033[92m[SYSTEM] Node {node_id} is ONLINE\033[0m")
         elif status_payload == "offline":
             print(f"\033[91m[ALERT] Node {node_id} is OFFLINE\033[0m")
+            # Check if node has active session and clean up
+            with _active_sessions_lock:
+                if node_id in active_sessions:
+                    print(f"[DISRUPTION] Node {node_id} offline during active collection - cleaning up")
+            cleanup_interrupted_session(node_id, reason="offline")
         return
 
     topic_parts = message.topic.strip("/").split("/")
+    if len(topic_parts) == 3 and topic_parts[0] == "commands" and topic_parts[2] == "stop_collect":
+        node_id = topic_parts[1]
+        raw = message.payload.decode(errors="replace").strip()
+        reason = "manual_override"
+        session_hint = None
+        try:
+            j = json.loads(raw)
+            if isinstance(j, dict) and isinstance(j.get("reason"), str):
+                reason = j.get("reason", reason)
+            if isinstance(j, dict) and isinstance(j.get("session"), str):
+                session_hint = j.get("session")
+        except json.JSONDecodeError:
+            pass
+        with _active_sessions_lock:
+            current = active_sessions.get(node_id, {})
+            current_session_id = current.get("session") if isinstance(current, dict) else None
+        if session_hint and current_session_id and session_hint != current_session_id:
+            print(
+                f"[CONTROL] Ignoring stale stop_collect for {node_id}: "
+                f"payload_session={session_hint} active_session={current_session_id}"
+            )
+            return
+        print(f"[CONTROL] stop_collect received for {node_id} reason={reason}")
+        cleanup_interrupted_session(node_id, reason=reason)
+        return
+
     if len(topic_parts) == 3 and topic_parts[0] == "sensors" and topic_parts[2] == "status":
         node_id = topic_parts[1]
         raw = message.payload.decode(errors="replace").strip()
@@ -346,6 +478,18 @@ def on_mqtt_message(client, userdata, message):
                     split_group = j.get("split_group")
         except json.JSONDecodeError:
             pass
+        stop_request = isinstance(label, str) and label.strip().lower() == "stop"
+        timeout_request = isinstance(sess, str) and sess.strip().lower() in {"interrupted", "timeout"}
+        if stop_request or timeout_request:
+            with _active_sessions_lock:
+                current_session = active_sessions.get(node_id, {})
+                current_session_id = current_session.get("session") if isinstance(current_session, dict) else None
+            print(
+                f"[CONTROL] Stop request received for {node_id} "
+                f"(current_session={current_session_id or 'none'}). Cleaning up active session."
+            )
+            cleanup_interrupted_session(node_id, reason="manual_override" if stop_request else "watchdog_timeout")
+            return
         if sess is None or not isinstance(sess, str) or not sess:
             # generate simple session id based on timestamp
             sess = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -361,6 +505,7 @@ def on_mqtt_message(client, userdata, message):
                 "campaign_id": campaign_id,
                 "split_group": split_group,
                 "created_at": datetime.now().timestamp(),
+                "last_upload_time": time.time(),  # Initialize watchdog timer
             }
         print(f"Collection command received: node={node_id}, label={label}, campaign={campaign_id}, run={run_id}, split={split_group}")
 
@@ -678,10 +823,48 @@ def upload_data():
                 "campaign_id": sess,
                 "split_group": "train",
                 "created_at": datetime.now().timestamp(),
+                "last_upload_time": time.time(),
             }
 
     with _active_sessions_lock:
         info = active_sessions.get(esp32_id, {})
+        aborted_for_node = dict(_aborted_sessions.get(esp32_id, {}))
+
+    if session_hdr is None and aborted_for_node and not info:
+        return jsonify({
+            "error": "session_stopped",
+            "message": "This node recently stopped a session and is rejecting uploads without a session id"
+        }), 409
+
+    # Check if this upload matches the current active session
+    # If Force Stop was used, active_sessions[esp32_id] would be removed
+    # Reject late-arriving packets from interrupted sessions
+    if isinstance(info, dict):
+        active_session_id = info.get("session")
+        if active_session_id and sess and active_session_id != sess:
+            print(
+                f"[SESSION MISMATCH] Rejecting upload from {esp32_id}: "
+                f"active_session={active_session_id}, received_session={sess}. "
+                f"This may be a late packet from an interrupted collection."
+            )
+            return jsonify({
+                "error": "session_mismatch",
+                "message": "This session has been stopped or replaced",
+                "active_session": active_session_id,
+                "received_session": sess
+            }), 409
+
+    if isinstance(sess, str) and sess in aborted_for_node:
+        print(
+            f"[SESSION ABORTED] Rejecting upload from {esp32_id}: session={sess} "
+            f"was stopped previously."
+        )
+        return jsonify({
+            "error": "session_aborted",
+            "message": "This session has been stopped",
+            "node": esp32_id,
+            "session": sess,
+        }), 409
 
     campaign_id = request.headers.get('X-Campaign-ID')
     run_id = request.headers.get('X-Run-ID') or sess
@@ -746,7 +929,7 @@ def upload_data():
 
     # Validation: The ESP32 sends a buffer of SUB_BATCH_SIZE
     expected_size = SUB_BATCH_SIZE * SUB_COUNT
-    
+
     if len(raw_data) != expected_size:
         print(f"DATA MISMATCH: Received {len(raw_data)}, expected {expected_size}")
         return "Wrong Size", 400
@@ -758,7 +941,7 @@ def upload_data():
 
     # Reshape binary data to DataFrame with optimized construction
     csi_matrix = np.frombuffer(raw_data, dtype=np.uint8).reshape(SUB_BATCH_SIZE, SUB_COUNT)
-    
+
     # Build all columns at once (O(1) dict construction vs O(n) per insert)
     row_count = len(csi_matrix)
     metadata_columns = {
@@ -775,11 +958,11 @@ def upload_data():
         "global_sample_idx": sub_batch_idx * SUB_BATCH_SIZE + np.arange(row_count, dtype=np.int32),
         "row_in_sub_batch": np.arange(row_count, dtype=np.int32),
     }
-    
+
     # Combine CSI data with metadata in single DataFrame construction
     csi_df = pd.DataFrame(csi_matrix, columns=CSI_HEADERS)
     df = pd.concat([pd.DataFrame(metadata_columns), csi_df], axis=1)
-    
+
     # Path setup: Use a unique sub-directory for this session (handles multiple
     # collections from the same node/state running concurrently).
     with _active_sessions_lock:
@@ -790,9 +973,8 @@ def upload_data():
         sess = datetime.now().strftime('%Y%m%d%H%M%S')
 
     session_dir = os.path.join(SAVE_DIR, esp32_id, room_state, campaign_slug, run_slug)
-    if not os.path.exists(session_dir):
-        os.makedirs(session_dir)
-    
+    os.makedirs(session_dir, exist_ok=True)  # Atomic: safe for concurrent access
+
     # Save each sub-batch as its own individual file named by its index (e.g., part_000.csv)
     # This allows requests to arrive in any order (out-of-sequence)
     part_filename = os.path.join(session_dir, f"part_{sub_batch_idx:03d}.csv")
@@ -812,7 +994,12 @@ def upload_data():
         received_at=received_at,
         row_count=len(df),
     )
-    
+
+    # Update last_upload_time for watchdog monitoring
+    with _active_sessions_lock:
+        if esp32_id in active_sessions and isinstance(active_sessions[esp32_id], dict):
+            active_sessions[esp32_id]["last_upload_time"] = time.time()
+
     # Check how many parts we have collected so far
     existing_parts = glob.glob(os.path.join(session_dir, "part_*.csv"))
     print(f"[{esp32_id}-{room_state}] Part {sub_batch_idx + 1}/{total_sub_batches} received (Current: {len(existing_parts)})")
@@ -859,13 +1046,18 @@ def upload_data():
             f"[PASO ALERT] /upload_data request time exceeded budget: "
             f"{upload_total_us}us > {PASO_END_TO_END_BUDGET_US}us"
         )
-    
+
     return "OK", 200
 
 
 def start_server(host=os.getenv("SERVER_HOST", "0.0.0.0"), port=int(os.getenv("SERVER_PORT", "5000"))):
     # Ensure the background cleanup thread is running before we start serving.
     _start_cleanup_thread()
+
+    # Start the watchdog monitor thread
+    watchdog_thread = threading.Thread(target=_watchdog_monitor, daemon=True)
+    watchdog_thread.start()
+    print("[WATCHDOG] Watchdog monitor thread started")
 
     if PASO_ASYNC_FINALIZE_ENABLED:
         _start_finalize_worker()
@@ -958,8 +1150,92 @@ def _cleanup_stale_entries(session_ttl_seconds: int = 1800, interval_seconds: in
 
             # Remove stale incomplete session directories as well.
             _cleanup_old_session_dirs()
+
+            # Prune aborted-session registry so late uploads are rejected only
+            # for a bounded retention window.
+            aborted_cutoff = now - ABORTED_SESSION_TTL_SECONDS
+            stale_aborted_nodes = []
+            for node_id, sessions in list(_aborted_sessions.items()):
+                stale_sessions = [sid for sid, ts in sessions.items() if ts < aborted_cutoff]
+                for sid in stale_sessions:
+                    sessions.pop(sid, None)
+                if not sessions:
+                    stale_aborted_nodes.append(node_id)
+            for node_id in stale_aborted_nodes:
+                _aborted_sessions.pop(node_id, None)
         except Exception as e:
             print(f"[TTL] cleanup error: {e}")
+
+
+def _watchdog_monitor():
+    """Monitor active sessions and trigger auto-stop if no data received within timeout"""
+    print(f"[WATCHDOG] Starting watchdog monitor (timeout={WATCHDOG_TIMEOUT_SECONDS}s, check_interval={WATCHDOG_CHECK_INTERVAL_SECONDS}s)")
+
+    while True:
+        time.sleep(WATCHDOG_CHECK_INTERVAL_SECONDS)
+
+        try:
+            now = time.time()
+            timed_out_nodes = []
+
+            with _active_sessions_lock:
+                for esp32_id, session_info in list(active_sessions.items()):
+                    if not isinstance(session_info, dict):
+                        continue
+
+                    last_upload = session_info.get("last_upload_time")
+                    if last_upload is None:
+                        continue
+
+                    elapsed = now - last_upload
+                    if elapsed > WATCHDOG_TIMEOUT_SECONDS:
+                        timed_out_nodes.append((esp32_id, session_info.get("session"), last_upload))
+
+            # Handle timeouts outside the lock
+            for esp32_id, session_id, last_upload in timed_out_nodes:
+                handle_watchdog_timeout(esp32_id, expected_session=session_id, expected_last_upload=last_upload)
+
+        except Exception as e:
+            print(f"[WATCHDOG] error: {e}")
+
+
+def handle_watchdog_timeout(esp32_id: str, expected_session: str | None = None, expected_last_upload: float | None = None):
+    """Handle watchdog timeout by stopping collection and cleaning up"""
+    with _active_sessions_lock:
+        session_info = active_sessions.get(esp32_id)
+        if not isinstance(session_info, dict):
+            return
+        current_session = session_info.get("session")
+        current_last_upload = session_info.get("last_upload_time")
+        if expected_session is not None and current_session != expected_session:
+            print(f"[WATCHDOG] Skipping stale timeout for {esp32_id}: session changed")
+            return
+        if expected_last_upload is not None and current_last_upload != expected_last_upload:
+            print(f"[WATCHDOG] Skipping stale timeout for {esp32_id}: upload timestamp changed")
+            return
+        if current_last_upload is None or (time.time() - current_last_upload) <= WATCHDOG_TIMEOUT_SECONDS:
+            return
+
+    print(f"[WATCHDOG TIMEOUT] No data from {esp32_id} for {WATCHDOG_TIMEOUT_SECONDS}s. Terminating session.")
+    
+    # Try to interrupt the ESP32 with an explicit stop command
+    try:
+        with _active_sessions_lock:
+            session_info = active_sessions.get(esp32_id, {})
+        topic = f"/commands/{esp32_id}/stop_collect"
+        payload = json.dumps({
+            "reason": "watchdog_timeout",
+            "session": session_info.get("session") if isinstance(session_info, dict) else "",
+            "label": session_info.get("label") if isinstance(session_info, dict) else "",
+            "source": "server"
+        })
+        mqtt_client.publish(topic, payload, qos=1)
+        print(f"[WATCHDOG] Sent stop_collect command to {esp32_id}")
+    except Exception as e:
+        print(f"[WATCHDOG] Failed to send stop_collect command to {esp32_id}: {e}")
+    
+    # Clean up partial data
+    cleanup_interrupted_session(esp32_id, reason="watchdog_timeout")
 
 
 def _start_cleanup_thread():

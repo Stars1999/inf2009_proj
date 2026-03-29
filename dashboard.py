@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QScrollArea,
     QSizePolicy,
+    QDialog,
 )
 
 import pandas as pd
@@ -88,6 +89,7 @@ KEYS_FILE = os.path.join(BASE_DIR, "keys.json")
 VIEW_FILE = os.path.join(BASE_DIR, "view_state.json")
 MODEL_FILE = os.path.join(BASE_DIR, "models.json")
 HEARTBEAT_FILE = os.path.join(BASE_DIR, "heartbeat_state.json")
+RUNTIME_FILE = os.path.join(BASE_DIR, "runtime_state.json")
 
 HEARTBEAT_TIMEOUT_S = 20
 REFRESH_INTERVAL_MS = 1500
@@ -264,11 +266,178 @@ QLabel.StatLabel {
 }
 """
 
+
+class AuthDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("AuthDialog")
+        self.setWindowTitle("Authentication Required")
+        self.setModal(True)
+        self.setFixedSize(520, 340)
+
+        # Remove close button and disable ESC key
+        self.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint)
+
+        self.setStyleSheet("""
+            QDialog#AuthDialog {
+                background-color: #eef2f7;
+            }
+            QFrame#AuthCard {
+                background-color: #ffffff;
+                border: 1px solid #d8e0ea;
+                border-radius: 16px;
+            }
+            QLabel#AuthTitle {
+                font-size: 20px;
+                font-weight: bold;
+                color: #1f2d3d;
+            }
+            QLabel#AuthSubtitle {
+                font-size: 13px;
+                color: #5b6b7f;
+            }
+            QLabel#AuthFormLabel {
+                color: #1f2d3d;
+                font-weight: 600;
+            }
+            QLineEdit#AuthInput {
+                background-color: #ffffff;
+                color: #111827;
+                border: 1px solid #c7d0db;
+                border-radius: 8px;
+                padding: 9px 12px;
+                min-height: 32px;
+            }
+            QLineEdit#AuthInput:focus {
+                border: 1px solid #1976d2;
+            }
+            QPushButton#AuthLoginButton {
+                background-color: #1976d2;
+                color: white;
+                padding: 10px 16px;
+                font-size: 14px;
+                font-weight: bold;
+                border-radius: 8px;
+                border: none;
+                min-height: 38px;
+            }
+            QPushButton#AuthLoginButton:hover {
+                background-color: #1565c0;
+            }
+            QLabel#AuthError {
+                color: #d32f2f;
+                font-size: 12px;
+            }
+        """)
+
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(20, 20, 20, 20)
+        outer_layout.setSpacing(0)
+
+        card = QFrame()
+        card.setObjectName("AuthCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(28, 24, 28, 24)
+        card_layout.setSpacing(14)
+
+        # Title and helper text
+        title = QLabel("Dashboard Login")
+        title.setObjectName("AuthTitle")
+        title.setAlignment(Qt.AlignCenter)
+        card_layout.addWidget(title)
+
+        subtitle = QLabel("Enter the admin credentials to continue.")
+        subtitle.setObjectName("AuthSubtitle")
+        subtitle.setAlignment(Qt.AlignCenter)
+        subtitle.setWordWrap(True)
+        card_layout.addWidget(subtitle)
+
+        # Username field
+        form_layout = QFormLayout()
+        form_layout.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form_layout.setFormAlignment(Qt.AlignTop)
+        form_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        form_layout.setHorizontalSpacing(16)
+        form_layout.setVerticalSpacing(12)
+
+        username_label = QLabel("Username:")
+        username_label.setObjectName("AuthFormLabel")
+        self.username_input = QLineEdit()
+        self.username_input.setObjectName("AuthInput")
+        self.username_input.setPlaceholderText("Enter username")
+        self.username_input.setClearButtonEnabled(True)
+        self.username_input.setMinimumHeight(38)
+        form_layout.addRow(username_label, self.username_input)
+
+        # Password field
+        password_label = QLabel("Password:")
+        password_label.setObjectName("AuthFormLabel")
+        self.password_input = QLineEdit()
+        self.password_input.setObjectName("AuthInput")
+        self.password_input.setPlaceholderText("Enter password")
+        self.password_input.setEchoMode(QLineEdit.Password)
+        self.password_input.setClearButtonEnabled(True)
+        self.password_input.setMinimumHeight(38)
+        self.password_input.returnPressed.connect(self.attempt_login)
+        form_layout.addRow(password_label, self.password_input)
+
+        card_layout.addLayout(form_layout)
+
+        # Error label
+        self.error_label = QLabel("")
+        self.error_label.setObjectName("AuthError")
+        self.error_label.setAlignment(Qt.AlignCenter)
+        self.error_label.setVisible(False)
+        self.error_label.setMinimumHeight(18)
+        card_layout.addWidget(self.error_label)
+
+        # Login button
+        self.login_button = QPushButton("Login")
+        self.login_button.setObjectName("AuthLoginButton")
+        self.login_button.setCursor(Qt.PointingHandCursor)
+        self.login_button.clicked.connect(self.attempt_login)
+        card_layout.addWidget(self.login_button)
+
+        card_layout.addStretch()
+        outer_layout.addWidget(card)
+
+        # Focus on username field
+        self.username_input.setFocus()
+
+    def attempt_login(self):
+        username = self.username_input.text().strip()
+        password = self.password_input.text()
+
+        if username == "admin" and password == "admin":
+            self.accept()
+        else:
+            self.error_label.setText("Invalid credentials. Please try again.")
+            self.error_label.setVisible(True)
+            self.password_input.clear()
+            self.password_input.setFocus()
+
+    def closeEvent(self, event):
+        # Prevent closing the dialog
+        event.ignore()
+
+    def keyPressEvent(self, event):
+        # Block ESC key to prevent authentication bypass
+        if event.key() == Qt.Key_Escape:
+            event.ignore()
+        else:
+            super().keyPressEvent(event)
+
+    def reject(self):
+        # Prevent dialog rejection via ESC or other means
+        pass  # Do nothing, dialog cannot be rejected
+
+
 class DashboardSignals(QObject):
     node_status = Signal(str, str)  # node_id, status
     key_status = Signal(str, str)  # key_id, status
     collection_progress = Signal(str, int, int)
     collection_complete = Signal(str, str, str)  # node_id, label, session
+    collection_stopped = Signal(str, dict)
     model_event = Signal(str, dict)
     training_result = Signal(str, bool, str)
     error = Signal(str)
@@ -341,9 +510,10 @@ class MqttClient(threading.Thread):
             if len(parts) >= 3 and parts[0] == "device" and parts[2] == "status":
                 node_id = parts[1]
                 status = payload.lower()
-                self.state.node_online[node_id] = (status == "online")
-                if status == "online":
-                    self.state.node_last_heartbeat[node_id] = time.time()
+                with self.state.lock:
+                    self.state.node_online[node_id] = (status == "online")
+                    if status == "online":
+                        self.state.node_last_heartbeat[node_id] = time.time()
                 self._enqueue_event("node_status", node_id, status)
                 return
 
@@ -372,24 +542,32 @@ class MqttClient(threading.Thread):
                     session = body.get("session")
                     if label in CALIB_STATES:
                         # ensure node entry exists
-                        self.state.esp_nodes.setdefault(node_id, {s: False for s in CALIB_STATES})
-                        self.state.esp_nodes[node_id][label] = True
+                        with self.state.lock:
+                            self.state.esp_nodes.setdefault(node_id, {s: False for s in CALIB_STATES})
+                            self.state.esp_nodes[node_id][label] = True
                         self._enqueue_event("collection_complete", node_id, label, session)
+                elif event == "collection_stopped":
+                    self._enqueue_event("collection_stopped", node_id, body)
                 elif event == "model_ready":
-                    self.state.model_state[node_id] = True
+                    with self.state.lock:
+                        self.state.model_state[node_id] = True
                     self._enqueue_event("model_event", node_id, body)
                 elif event in ("model_download_failed", "model_download_incompatible"):
-                    self.state.model_state[node_id] = False
+                    with self.state.lock:
+                        self.state.model_state[node_id] = False
                     self._enqueue_event("model_event", node_id, body)
                 elif event == "model_cleared":
-                    self.state.model_state[node_id] = False
+                    with self.state.lock:
+                        self.state.model_state[node_id] = False
                     self._enqueue_event("model_event", node_id, body)
                 elif event == "heartbeat":
-                    self.state.node_last_heartbeat[node_id] = time.time()
+                    with self.state.lock:
+                        self.state.node_last_heartbeat[node_id] = time.time()
                 elif event == "state_change":
                     state_val = body.get("state")
                     if isinstance(state_val, str):
-                        self.state.node_detected_state[node_id] = state_val
+                        with self.state.lock:
+                            self.state.node_detected_state[node_id] = state_val
                 elif event == "ack":
                     cmd = body.get("cmd", "?")
                     self._enqueue_event("error", f"{node_id} acknowledged {cmd}")
@@ -399,19 +577,21 @@ class MqttClient(threading.Thread):
                 return
 
             # Legacy plain-topic key toggles
-            if payload in self.state.keys:
-                if topic.strip() == "Key Unlocked":
-                    self.state.keys[payload] = "out"
-                    self._enqueue_event("key_status", payload, "out")
-                elif topic.strip() == "Key Returned":
-                    self.state.keys[payload] = "in"
-                    self._enqueue_event("key_status", payload, "in")
+            with self.state.lock:
+                if payload in self.state.keys:
+                    if topic.strip() == "Key Unlocked":
+                        self.state.keys[payload] = "out"
+                        self._enqueue_event("key_status", payload, "out")
+                    elif topic.strip() == "Key Returned":
+                        self.state.keys[payload] = "in"
+                        self._enqueue_event("key_status", payload, "in")
         except Exception as e:
             self._enqueue_event("error", f"MQTT message handling error: {e}")
 
 
 class AppState:
     def __init__(self):
+        self.lock = threading.RLock()
         self.keys = {f"Key {i}": "in" for i in range(1, 25)}
         self.esp_nodes = {f"RACK_{i}": {s: False for s in CALIB_STATES} for i in range(1, 5)}
         self.node_online = {n: False for n in self.esp_nodes}
@@ -419,7 +599,7 @@ class AppState:
         self.last_node = None
         self.last_view = "Homepage"
         self.model_state = {n: False for n in self.esp_nodes}
-        self.node_detected_state = {n: "" for n in self.esp_nodes}
+        self.node_detected_state = {n: "unknown" for n in self.esp_nodes}
         self.expected_calib = {}
         self.expected_session = {}
         self.collection_campaign = {}
@@ -432,47 +612,104 @@ class AppState:
         self.config = {"broker": DEFAULT_MQTT_BROKER, "port": DEFAULT_MQTT_PORT, "csi_data_dir": CSI_DATA_DIR}
 
     def save_json(self, path, data):
+        tmp_path = f"{path}.tmp"
         try:
-            with open(path, "w", encoding="utf-8") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-        except Exception:
-            pass
+            os.replace(tmp_path, path)
+        except Exception as e:
+            print(f"[STATE] Failed to save {path}: {e}")
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
 
     def load_json(self, path, default):
         try:
             if os.path.exists(path):
                 with open(path, "r", encoding="utf-8") as f:
                     return json.load(f)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[STATE] Failed to load {path}: {e}")
         return default
 
     def load_all(self):
-        self.keys.update(self.load_json(KEYS_FILE, {}))
-        calib = self.load_json(CALIB_FILE, {})
-        for k, v in calib.items():
-            if k in self.esp_nodes and isinstance(v, dict):
-                for s, val in v.items():
-                    if s in CALIB_STATES and isinstance(val, bool):
-                        self.esp_nodes[k][s] = val
-        self.model_state.update(self.load_json(MODEL_FILE, {}))
-        view = self.load_json(VIEW_FILE, {})
-        if isinstance(view, dict):
-            self.last_view = view.get("last_page", self.last_view)
-            self.last_node = view.get("last_node", self.last_node)
-        self.config.update(self.load_json(CONFIG_FILE, {}))
-        # Keep CSI path usable on the current host (legacy configs may contain
-        # stale absolute paths from another machine/OS).
-        self.config["csi_data_dir"] = self.resolve_csi_data_dir()
-        self.node_last_heartbeat.update(self.load_json(HEARTBEAT_FILE, {}))
+        with self.lock:
+            self.keys.update(self.load_json(KEYS_FILE, {}))
+            calib = self.load_json(CALIB_FILE, {})
+            for k, v in calib.items():
+                if k in self.esp_nodes and isinstance(v, dict):
+                    for s, val in v.items():
+                        if s in CALIB_STATES and isinstance(val, bool):
+                            self.esp_nodes[k][s] = val
+            self.model_state.update(self.load_json(MODEL_FILE, {}))
+            view = self.load_json(VIEW_FILE, {})
+            if isinstance(view, dict):
+                self.last_view = view.get("last_page", self.last_view)
+                self.last_node = view.get("last_node", self.last_node)
+            self.config.update(self.load_json(CONFIG_FILE, {}))
+            # Keep CSI path usable on the current host (legacy configs may contain
+            # stale absolute paths from another machine/OS).
+            self.config["csi_data_dir"] = self.resolve_csi_data_dir()
+            self.node_last_heartbeat.update(self.load_json(HEARTBEAT_FILE, {}))
+
+            runtime = self.load_json(RUNTIME_FILE, {})
+            if isinstance(runtime, dict):
+                for node, val in runtime.get("expected_calib", {}).items():
+                    if node in self.esp_nodes and isinstance(val, str):
+                        self.expected_calib[node] = val
+                for node, val in runtime.get("expected_session", {}).items():
+                    if node in self.esp_nodes and isinstance(val, str):
+                        self.expected_session[node] = val
+                for node, val in runtime.get("collection_campaign", {}).items():
+                    if node in self.esp_nodes and isinstance(val, str):
+                        self.collection_campaign[node] = val
+                for node, val in runtime.get("collection_run_counter", {}).items():
+                    if node in self.esp_nodes and isinstance(val, int):
+                        self.collection_run_counter[node] = val
+                for node, val in runtime.get("collection_in_progress", {}).items():
+                    if node in self.esp_nodes and isinstance(val, bool):
+                        self.collection_in_progress[node] = val
+                for node, val in runtime.get("collection_progress", {}).items():
+                    if node in self.esp_nodes and isinstance(val, (list, tuple)) and len(val) == 2:
+                        try:
+                            self.collection_progress[node] = (int(val[0]), int(val[1]))
+                        except Exception:
+                            pass
+                for node, val in runtime.get("last_calib_choice", {}).items():
+                    if node in self.esp_nodes and isinstance(val, str):
+                        self.last_calib_choice[node] = val
+                for node, val in runtime.get("last_split_choice", {}).items():
+                    if node in self.esp_nodes and isinstance(val, str):
+                        self.last_split_choice[node] = val
+                for node, val in runtime.get("training_in_progress", {}).items():
+                    if node in self.esp_nodes and isinstance(val, bool):
+                        self.training_in_progress[node] = val
+                for node, val in runtime.get("node_detected_state", {}).items():
+                    if node in self.esp_nodes and isinstance(val, str):
+                        self.node_detected_state[node] = val
 
     def persist(self):
-        self.save_json(KEYS_FILE, self.keys)
-        self.save_json(CALIB_FILE, self.esp_nodes)
-        self.save_json(MODEL_FILE, self.model_state)
-        self.save_json(VIEW_FILE, {"last_page": self.last_view, "last_node": self.last_node})
-        self.save_json(CONFIG_FILE, self.config)
-        self.save_json(HEARTBEAT_FILE, self.node_last_heartbeat)
+        with self.lock:
+            self.save_json(KEYS_FILE, self.keys)
+            self.save_json(CALIB_FILE, self.esp_nodes)
+            self.save_json(MODEL_FILE, self.model_state)
+            self.save_json(VIEW_FILE, {"last_page": self.last_view, "last_node": self.last_node})
+            self.save_json(CONFIG_FILE, self.config)
+            self.save_json(HEARTBEAT_FILE, self.node_last_heartbeat)
+            self.save_json(RUNTIME_FILE, {
+                "expected_calib": self.expected_calib,
+                "expected_session": self.expected_session,
+                "collection_campaign": self.collection_campaign,
+                "collection_run_counter": self.collection_run_counter,
+                "collection_in_progress": self.collection_in_progress,
+                "collection_progress": self.collection_progress,
+                "last_calib_choice": self.last_calib_choice,
+                "last_split_choice": self.last_split_choice,
+                "training_in_progress": self.training_in_progress,
+                "node_detected_state": self.node_detected_state,
+            })
 
     def discount_stale_heartbeat(self, node_id):
         last = self.node_last_heartbeat.get(node_id, 0)
@@ -589,6 +826,16 @@ class AppState:
 class DashboardMain(QMainWindow):
     def __init__(self):
         super().__init__()
+        self._authenticated = False
+
+        # Show authentication dialog before proceeding
+        auth_dialog = AuthDialog()
+        if auth_dialog.exec() != QDialog.Accepted:
+            # If dialog is somehow bypassed or rejected, exit application
+            QApplication.quit()
+            return
+        self._authenticated = True
+
         self.setWindowTitle("Zero-Trust Physical Key Governance")
         self.resize(1300, 820)
         # Cap window height to the available screen geometry to avoid growing beyond the display
@@ -610,6 +857,7 @@ class DashboardMain(QMainWindow):
         self.signals.key_status.connect(self.on_key_status)
         self.signals.collection_progress.connect(self.on_collection_progress)
         self.signals.collection_complete.connect(self.on_collection_complete)
+        self.signals.collection_stopped.connect(self.on_collection_stopped)
         self.signals.model_event.connect(self.on_model_event)
         self.signals.training_result.connect(lambda node, success, msg: self.pages["ESP32-C3 Configuration"].on_training_result(node, success, msg))
         self.signals.error.connect(self.log_message)
@@ -620,6 +868,9 @@ class DashboardMain(QMainWindow):
         self.update_timer = QTimer(self)
         self.update_timer.timeout.connect(self.periodic_refresh)
         self.update_timer.start(REFRESH_INTERVAL_MS)
+
+    def is_authenticated(self):
+        return self._authenticated
 
     def setup_ui(self):
         self.setStyleSheet(MODERN_STYLE)
@@ -708,29 +959,111 @@ class DashboardMain(QMainWindow):
                 self.signals.collection_progress.emit(event[1], event[2], event[3])
             elif kind == "collection_complete":
                 self.signals.collection_complete.emit(event[1], event[2], event[3])
+            elif kind == "collection_stopped":
+                self.signals.collection_stopped.emit(event[1], event[2])
             elif kind == "model_event":
                 self.signals.model_event.emit(event[1], event[2])
 
     def periodic_refresh(self):
         self.process_mqtt_events()
-        if self.state.node_online:
-            for node_id, last in self.state.node_last_heartbeat.items():
+        with self.state.lock:
+            heartbeat_items = list(self.state.node_last_heartbeat.items())
+            online_snapshot = dict(self.state.node_online)
+        if online_snapshot:
+            for node_id, last in heartbeat_items:
                 if not last:
                     continue
                 age = time.time() - last
                 if age > HEARTBEAT_TIMEOUT_S:
-                    self.state.node_online[node_id] = False
+                    # Detect transition to offline
+                    was_online = online_snapshot.get(node_id, False)
+                    if was_online:
+                        self.propagate_node_status_change(node_id, False)
+                    else:
+                        with self.state.lock:
+                            self.state.node_online[node_id] = False
         if self.stack.currentWidget() in [self.pages["ESP32-C3 Configuration"], self.pages["Homepage"], self.pages["Key Management"]]:
             self.pages["ESP32-C3 Configuration"].refresh(force=True)
             self.pages["Homepage"].refresh()
             self.pages["Key Management"].refresh()
 
+    def propagate_node_status_change(self, node_id, is_online):
+        """Centralized method to handle node status changes"""
+        with self.state.lock:
+            was_online = self.state.node_online.get(node_id, False)
+            self.state.node_online[node_id] = is_online
+            should_handle_disruption = False
+            # If going offline, reset detected state to unknown
+            if was_online and not is_online:
+                self.state.node_detected_state[node_id] = "unknown"
+                # If transitioning offline during active collection, handle disruption
+                should_handle_disruption = self.state.collection_in_progress.get(node_id, False)
+
+        if should_handle_disruption:
+            self.handle_collection_disruption(node_id)
+
+        # Update all UI pages
+        if hasattr(self, 'pages'):
+            if "ESP32-C3 Configuration" in self.pages:
+                self.pages["ESP32-C3 Configuration"].refresh_node_status(node_id)
+            if "Homepage" in self.pages:
+                self.pages["Homepage"].refresh_node_status(node_id)
+
+        # Persist state
+        self.state.persist()
+
+    def handle_collection_disruption(self, node_id):
+        """Handle disruption when node goes offline during calibration"""
+        self.log_message(f"⚠️ Collection disrupted: {node_id} went offline during calibration")
+
+        # Reset calibration state
+        with self.state.lock:
+            self.state.collection_in_progress[node_id] = False
+            self.state.collection_progress[node_id] = (0, 0)
+            self.state.expected_calib.pop(node_id, None)
+            self.state.expected_session.pop(node_id, None)
+
+        # Update UI
+        page = self.pages.get("ESP32-C3 Configuration")
+        if page:
+            try:
+                page.set_progress(node_id, 0, 0)
+                page.force_stop_button.hide()  # Hide force stop button
+                page.refresh()
+                page.status_label.setText(f"⚠️ Run corrupted: ESP32 went offline. Data collection incomplete.")
+                page.status_label.setStyleSheet("font-weight: bold; color: #e74c3c; margin-top: 10px; font-size: 15px;")
+            except Exception:
+                pass
+
+        # Show warning dialog
+        QMessageBox.warning(
+            self,
+            "Collection Interrupted",
+            f"{node_id} went offline during calibration. Partial data has been discarded."
+        )
+
+        # Persist state changes
+        self.state.persist()
+
     def on_node_status(self, node_id, status):
         self.log_message(f"Node {node_id} status {status}")
-        self.state.node_online[node_id] = (status == "online")
-        if status == "online":
-            self.state.node_last_heartbeat[node_id] = time.time()
-        self.state.persist()
+        is_online = (status == "online")
+        with self.state.lock:
+            was_online = self.state.node_online.get(node_id, False)
+
+        if is_online != was_online:
+            # Use centralized propagation for status changes
+            if status == "online":
+                with self.state.lock:
+                    self.state.node_last_heartbeat[node_id] = time.time()
+            self.propagate_node_status_change(node_id, is_online)
+        else:
+            # Just update heartbeat if status unchanged
+            if status == "online":
+                with self.state.lock:
+                    self.state.node_last_heartbeat[node_id] = time.time()
+                    self.state.persist()
+
         if self.stack.currentWidget() in [self.pages["ESP32-C3 Configuration"], self.pages["Homepage"], self.pages["Key Management"]]:
             self.pages["ESP32-C3 Configuration"].refresh(force=True)
             self.pages["Homepage"].refresh()
@@ -738,29 +1071,32 @@ class DashboardMain(QMainWindow):
 
     def on_key_status(self, key_name, status):
         self.log_message(f"{key_name} status changed to {status}")
-        self.state.keys[key_name] = status
-        self.state.persist()
+        with self.state.lock:
+            self.state.keys[key_name] = status
+            self.state.persist()
         if self.stack.currentWidget() == self.pages["Key Management"]:
             self.pages["Key Management"].refresh()
         self.pages["Homepage"].refresh()
 
     def on_collection_progress(self, node_id, cur, total):
-        self.state.collection_in_progress[node_id] = True
-        self.state.collection_progress[node_id] = (cur, total)
+        with self.state.lock:
+            self.state.collection_in_progress[node_id] = True
+            self.state.collection_progress[node_id] = (cur, total)
         page = self.pages["ESP32-C3 Configuration"]
         page.set_progress(node_id, cur, total)
         # Refresh counts/display if the page is visible
         if self.stack.currentWidget() == page:
             page.refresh()
-    
+
     def on_collection_complete(self, node_id, label, session):
         self.log_message(f"Collection complete: {node_id}/{label} session={session}")
-        self.state.esp_nodes[node_id][label] = True
-        self.state.collection_in_progress[node_id] = False
-        self.state.collection_progress[node_id] = (0, 0)
-        self.state.expected_calib.pop(node_id, None)
-        self.state.expected_session.pop(node_id, None)
-        self.state.persist()
+        with self.state.lock:
+            self.state.esp_nodes[node_id][label] = True
+            self.state.collection_in_progress[node_id] = False
+            self.state.collection_progress[node_id] = (0, 0)
+            self.state.expected_calib.pop(node_id, None)
+            self.state.expected_session.pop(node_id, None)
+            self.state.persist()
 
         # Immediately reset the calibration progress UI to default (avoid lingering 100%)
         page = self.pages.get("ESP32-C3 Configuration")
@@ -775,14 +1111,42 @@ class DashboardMain(QMainWindow):
         if self.stack.currentWidget() == self.pages["ESP32-C3 Configuration"]:
             self.pages["ESP32-C3 Configuration"].refresh()
 
+    def on_collection_stopped(self, node_id, body):
+        reason = body.get("reason", "stopped") if isinstance(body, dict) else "stopped"
+        source = body.get("source", "unknown") if isinstance(body, dict) else "unknown"
+        with self.state.lock:
+            was_collecting = bool(self.state.collection_in_progress.get(node_id, False))
+            self.state.collection_in_progress[node_id] = False
+            self.state.collection_progress[node_id] = (0, 0)
+            self.state.expected_calib.pop(node_id, None)
+            self.state.expected_session.pop(node_id, None)
+            self.state.persist()
+
+        if not was_collecting:
+            return
+
+        self.log_message(f"Collection stopped: {node_id} reason={reason} source={source}")
+        page = self.pages.get("ESP32-C3 Configuration")
+        if page and page.node_selector.currentText() == node_id:
+            try:
+                page.set_progress(node_id, 0, 0)
+                page.force_stop_button.hide()
+                page.refresh()
+                page.status_label.setText(f"Status: Calibration stopped ({reason})")
+                page.status_label.setStyleSheet("font-weight: bold; color: #ff9800; margin-top: 10px; font-size: 15px;")
+            except Exception:
+                pass
+
     def on_model_event(self, node_id, body):
         event = body.get("event", "")
         if event == "model_ready":
-            self.state.model_state[node_id] = True
-            self.state.persist()
+            with self.state.lock:
+                self.state.model_state[node_id] = True
+                self.state.persist()
         elif event in ("model_download_failed", "model_download_incompatible"):
-            self.state.model_state[node_id] = False
-            self.state.persist()
+            with self.state.lock:
+                self.state.model_state[node_id] = False
+                self.state.persist()
         self.pages["ESP32-C3 Configuration"].on_model_event(node_id, body)
 
     def log_message(self, text):
@@ -801,28 +1165,28 @@ class HomePage(QWidget):
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layout.setSpacing(20)
-        
+
         title = QLabel("Dashboard Overview")
         title.setObjectName("PageTitle")
         self.layout.addWidget(title)
 
         cards_layout = QHBoxLayout()
         cards_layout.setSpacing(20)
-        
+
         self.cards = {}
         for label_text in ["Total Keys", "Issued", "In Vault", "Nodes Online", "Nodes Offline"]:
             card = QFrame()
             card.setProperty("class", "StatCard")
             cl = QVBoxLayout(card)
-            
+
             val_lbl = QLabel("0")
             val_lbl.setProperty("class", "StatValue")
             val_lbl.setAlignment(Qt.AlignCenter)
-            
+
             title_lbl = QLabel(label_text)
             title_lbl.setProperty("class", "StatLabel")
             title_lbl.setAlignment(Qt.AlignCenter)
-            
+
             cl.addWidget(val_lbl)
             cl.addWidget(title_lbl)
             cards_layout.addWidget(card)
@@ -856,7 +1220,7 @@ class HomePage(QWidget):
         vault = total_keys - issued
         online = sum(1 for n in self.state.esp_nodes if self.state.node_online.get(n, False))
         offline = len(self.state.esp_nodes) - online
-        
+
         self.cards["Total Keys"].setText(str(total_keys))
         self.cards["Issued"].setText(str(issued))
         self.cards["In Vault"].setText(str(vault))
@@ -930,6 +1294,11 @@ class HomePage(QWidget):
             col = i % cols
             self.nodes_grid.addWidget(tile, row, col)
 
+    def refresh_node_status(self, node_id):
+        """Update UI when node status changes"""
+        # Full refresh to update node tiles and counters
+        self.refresh()
+
 
 class KeyMgmtPage(QWidget):
     def __init__(self, state):
@@ -937,21 +1306,21 @@ class KeyMgmtPage(QWidget):
         self.state = state
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
-        
+
         title = QLabel("Key Management")
         title.setObjectName("PageTitle")
         self.layout.addWidget(title)
-        
+
         self.grid_widget = QWidget()
         self.grid_layout = QGridLayout(self.grid_widget)
         self.grid_layout.setSpacing(15)
-        
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.grid_widget)
         scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; } QWidget#GridWidget { background-color: transparent; }")
         self.grid_widget.setObjectName("GridWidget")
-        
+
         self.layout.addWidget(scroll)
 
     def refresh(self):
@@ -969,30 +1338,30 @@ class KeyMgmtPage(QWidget):
             if len(parts) > 1 and parts[1].isdigit():
                 return int(parts[1])
             return 0
-            
+
         keys = sorted(self.state.keys.items(), key=lambda x: extract_num(x[0]))
-        
+
         cols = 6
         for i, (k, v) in enumerate(keys):
             frame = QFrame()
             color = "#4caf50" if v == "in" else "#f44336"
             frame.setStyleSheet(f"QFrame {{ background-color: {color}; color: white; border-radius: 8px; padding: 16px; border: 1px solid rgba(0,0,0,0.1); }}")
-            
+
             flay = QVBoxLayout(frame)
             flay.setContentsMargins(5, 10, 5, 10)
             flay.setSpacing(8)
-            
+
             lbl = QLabel(k)
             lbl.setAlignment(Qt.AlignCenter)
             lbl.setStyleSheet("font-size: 18px; font-weight: bold; background: transparent; border: none;")
-            
+
             status_lbl = QLabel(v.upper())
             status_lbl.setAlignment(Qt.AlignCenter)
             status_lbl.setStyleSheet("font-size: 21px; font-weight: bold; opacity: 0.95; background: transparent; border: none;")
-            
+
             flay.addWidget(lbl)
             flay.addWidget(status_lbl)
-            
+
             row = i // cols
             col = i % cols
             self.grid_layout.addWidget(frame, row, col)
@@ -1005,7 +1374,7 @@ class ESPConfigPage(QWidget):
         self.parent = parent
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        
+
         title = QLabel("ESP32-C3 Calibration & Training")
         title.setObjectName("PageTitle")
         layout.addWidget(title)
@@ -1013,9 +1382,9 @@ class ESPConfigPage(QWidget):
         top_widget = QFrame()
         top_widget.setObjectName("StatCard")
         top_layout = QVBoxLayout(top_widget)
-        
+
         controls_layout = QHBoxLayout()
-        
+
         self.node_selector = QComboBox()
         self.node_selector.addItems(sorted(self.state.esp_nodes.keys()))
         self.node_selector.currentTextChanged.connect(self.update_details)
@@ -1036,7 +1405,26 @@ class ESPConfigPage(QWidget):
         self.start_button.setObjectName("ActionBtn")
         self.start_button.clicked.connect(self.start_calibration)
         controls_layout.addWidget(self.start_button)
-        
+
+        # Force Stop button (initially hidden)
+        self.force_stop_button = QPushButton("Force Stop")
+        self.force_stop_button.setStyleSheet("""
+            QPushButton {
+                background-color: #e74c3c;
+                color: white;
+                padding: 8px 16px;
+                font-weight: bold;
+                border-radius: 5px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #c0392b;
+            }
+        """)
+        self.force_stop_button.clicked.connect(self.force_stop_calibration)
+        self.force_stop_button.hide()
+        controls_layout.addWidget(self.force_stop_button)
+
         top_layout.addLayout(controls_layout)
 
         self.status_label = QLabel("Status: Idle")
@@ -1072,7 +1460,7 @@ class ESPConfigPage(QWidget):
         self.reset_button.clicked.connect(self.reset_calibrations)
         actions_layout.addWidget(self.reset_button)
         actions_layout.addStretch(1)
-        
+
         layout.addLayout(actions_layout)
 
         table_label = QLabel("Calibration Status")
@@ -1140,6 +1528,7 @@ class ESPConfigPage(QWidget):
         if not node:
             return
         status = "online" if self.state.node_online.get(node) else "offline"
+        is_online = self.state.node_online.get(node, False)
 
         # Check for model artifacts on disk
         node_model_dir = os.path.join(MODEL_STORE_DIR, node)
@@ -1175,33 +1564,80 @@ class ESPConfigPage(QWidget):
         else:
             last_seen = "never"
 
-        base_text = f"Node: {node} | Status: {status.upper()} | Last seen: {last_seen} | Current State: {self.state.node_detected_state.get(node, 'unknown')} | {model_text}"
+        current_state = self.state.node_detected_state.get(node) or "unknown"
+        base_text = f"Node: {node} | Status: {status.upper()} | Last seen: {last_seen} | Current State: {current_state} | {model_text}"
         cur, total = self.state.collection_progress.get(node, (0, 0))
         ready_from_progress = total > 0 and cur >= total
         collecting = bool(self.state.collection_in_progress.get(node, False))
 
-        # Calibration action state mirrors legacy behavior: disable while collecting,
-        # then re-enable once upload reaches the final sub-batch.
-        self.start_button.setEnabled(not (collecting and not ready_from_progress))
+        # Calibration action state: disable if offline, or if collecting (unless ready)
+        can_calibrate = is_online and not (collecting and not ready_from_progress)
+        self.start_button.setEnabled(can_calibrate)
+
+        # Update button styling and tooltip based on online status
+        if not is_online:
+            self.start_button.setStyleSheet("""
+                QPushButton {
+                    background-color: #b0b0b0;
+                    color: #666666;
+                    padding: 8px 16px;
+                    font-weight: bold;
+                    border-radius: 5px;
+                    border: none;
+                }
+            """)
+            self.start_button.setToolTip("Node is offline. Wait for heartbeat to enable calibration.")
+        else:
+            # Restore normal styling
+            self.start_button.setStyleSheet("")
+            self.start_button.setToolTip("")
 
         if self.state.training_in_progress.get(node, False):
             status_text = "Training in progress..."
-            status_color = "#7b1fa2"
+            self.status_label.setText(status_text)
+            self.status_label.setStyleSheet(f"font-weight: bold; color: #7b1fa2; margin-top: 10px; font-size: 15px;")
         elif collecting:
             if ready_from_progress:
                 status_text = f"Status: Upload complete ({cur}/{total}) - waiting for server merge"
-                status_color = "#ffb300"
+                self.status_label.setText(status_text)
+                self.status_label.setStyleSheet(f"font-weight: bold; color: #ffb300; margin-top: 10px; font-size: 15px;")
             elif total > 0:
                 status_text = f"Status: Calibrating {cur}/{total} sub-batches uploaded"
-                status_color = "#1976d2"
+                self.status_label.setText(status_text)
+                self.status_label.setStyleSheet(f"font-weight: bold; color: #1976d2; margin-top: 10px; font-size: 15px;")
             else:
                 status_text = "Status: Calibration started"
-                status_color = "#1976d2"
+                self.status_label.setText(status_text)
+                self.status_label.setStyleSheet(f"font-weight: bold; color: #1976d2; margin-top: 10px; font-size: 15px;")
         else:
-            status_text = base_text
-            status_color = "#4caf50" if self.state.node_online.get(node) else "#d32f2f"
-        self.status_label.setText(status_text)
-        self.status_label.setStyleSheet(f"font-weight: bold; color: {status_color}; margin-top: 10px; font-size: 15px;")
+            # Use HTML to color different parts of the status text
+            detected_state = self.state.node_detected_state.get(node) or "unknown"
+
+            # Map state to color and display text
+            state_colors = {
+                "door_open": ("#d32f2f", "DOOR OPEN"),
+                "door_closed": ("#2e7d32", "DOOR CLOSED"),
+                "person_standing": ("#ff8f00", "PERSON STANDING"),
+                "unknown": ("#607d8b", "UNKNOWN")
+            }
+            state_color, state_display = state_colors.get(detected_state, ("#607d8b", "UNKNOWN"))
+
+            # Online/offline color
+            online_color = "#4caf50" if is_online else "#d32f2f"
+            online_text = status.upper()
+
+            # Construct HTML with colored parts
+            status_html = (
+                f'<span style="color: black;">Node: {node} | Status: </span>'
+                f'<span style="color: {online_color};">{online_text}</span>'
+                f'<span style="color: black;"> | Last seen: {last_seen} | Current State: </span>'
+                f'<span style="color: {state_color};">{state_display}</span>'
+                f'<span style="color: black;"> | {model_text}</span>'
+            )
+
+            self.status_label.setText(status_html)
+            self.status_label.setStyleSheet(f"font-weight: bold; margin-top: 10px; font-size: 15px;")
+
 
         # Enable/disable training and load buttons appropriately
         can_train = all(self.state.esp_nodes.get(node, {}).get(s, False) for s in CALIB_STATES) and not self.state.training_in_progress.get(node, False)
@@ -1219,7 +1655,7 @@ class ESPConfigPage(QWidget):
             self.detail_table.setItem(i, 0, QTableWidgetItem(f"{st} ({file_count})"))
             done = self.state.esp_nodes.get(node, {}).get(st, False)
             self.detail_table.setItem(i, 1, QTableWidgetItem("Yes" if done else "No"))
-            
+
             info = labels_info.get(st, {})
             splits = info.get("split_rows", {}) if isinstance(info, dict) else {}
             self.detail_table.setItem(i, 2, QTableWidgetItem(str(splits.get("train", 0))))
@@ -1241,6 +1677,12 @@ class ESPConfigPage(QWidget):
 
     def update_details(self, _node):
         self.refresh()
+
+    def refresh_node_status(self, node_id):
+        """Update UI when node status changes"""
+        # If this is the currently selected node, refresh the display
+        if self.node_selector.currentText() == node_id:
+            self.refresh()
 
     def _publish_collect(self, node, label, split, retries=3):
         if not node:
@@ -1285,9 +1727,16 @@ class ESPConfigPage(QWidget):
             QMessageBox.warning(self, "No Node", "Please select a node")
             return
 
+        # Safety check: prevent calibration if node is offline
+        if not self.state.node_online.get(node, False):
+            QMessageBox.warning(self, "Node Offline",
+                              f"{node} is currently offline. Please wait for the node to come online before starting calibration.")
+            return
+
         if self._publish_collect(node, label, split):
             self.status_label.setText(f"Status: Calibration started for {node} ({label}, {split})")
             self.start_button.setEnabled(False)
+            self.force_stop_button.show()  # Show force stop button during calibration
             self.calib_progress.setValue(0)
             self.state.persist()
             self.refresh(force=False)
@@ -1295,6 +1744,51 @@ class ESPConfigPage(QWidget):
             self.state.collection_in_progress[node] = False
             self.state.collection_progress[node] = (0, 0)
             self.status_label.setText("Collect publish failed")
+
+    def force_stop_calibration(self):
+        """Manually stop an active calibration"""
+        node = self.node_selector.currentText()
+        if not node:
+            return
+        self.force_stop_button.setEnabled(False)
+
+        session_id = self.state.expected_session.get(node, "")
+        label = self.state.expected_calib.get(node, self.label_selector.currentText())
+        topic = f"/commands/{node}/stop_collect"
+        payload = json.dumps({
+            "reason": "manual_override",
+            "session": session_id,
+            "label": label,
+            "source": "dashboard",
+        })
+
+        try:
+            self.parent.mqtt.client.publish(topic, payload, qos=1)
+            self.parent.log_message(f"Sent stop command to {node}")
+        except Exception as e:
+            self.parent.log_message(f"Failed to send stop command: {e}")
+
+        # Reset local state
+        with self.state.lock:
+            self.state.collection_in_progress[node] = False
+            self.state.collection_progress[node] = (0, 0)
+            self.state.expected_calib.pop(node, None)
+            self.state.expected_session.pop(node, None)
+
+        # Update UI
+        self.calib_progress.setValue(0)
+        self.force_stop_button.hide()
+        self.force_stop_button.setEnabled(True)  # Re-enable for next use
+
+        # Persist and refresh
+        self.state.persist()
+        self.refresh()
+        self.status_label.setText("Status: Calibration stopped (ESP32 may send remaining buffered packets)")
+        self.status_label.setStyleSheet("font-weight: bold; color: #ff9800; margin-top: 10px; font-size: 15px;")
+
+        QMessageBox.information(self, "Calibration Stopped",
+                              f"Dashboard has stopped tracking calibration for {node}.\n\n"
+                              "The ESP32 should stop collecting immediately. Any late packets will be rejected by the server.")
 
     def train_model(self):
         node = self.node_selector.currentText()
@@ -1411,15 +1905,15 @@ class ESPConfigPage(QWidget):
         node = self.node_selector.currentText()
         if not node:
             return
-        
+
         reply = QMessageBox.question(
-            self, 
+            self,
             'Reset Calibrations',
             f'Delete ALL calibration data for {node}?\n\nThis will:\n- Clear all state flags\n- Delete CSI data files\n- Delete model artifacts\n- Cannot be undone',
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
-        
+
         if reply != QMessageBox.Yes:
             return
 
@@ -1512,9 +2006,12 @@ class ESPConfigPage(QWidget):
         if total <= 0:
             self.calib_progress.setValue(0)
             self.start_button.setEnabled(False)
+            self.force_stop_button.hide()  # Hide force stop when no active calibration
             return
         self.calib_progress.setValue(int(cur / total * 100))
         self.start_button.setEnabled(cur >= total)
+        if cur >= total:
+            self.force_stop_button.hide()  # Hide force stop when complete
         if cur < total:
             self.status_label.setText(f"Status: {cur}/{total} sub-batches uploaded")
         else:
@@ -1927,11 +2424,11 @@ class SettingsPage(QWidget):
         self.parent = parent
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
-        
+
         title = QLabel("System Settings")
         title.setObjectName("PageTitle")
         self.layout.addWidget(title)
-        
+
         form_frame = QFrame()
         form_frame.setObjectName("StatCard")
         form_layout = QFormLayout(form_frame)
@@ -1941,13 +2438,13 @@ class SettingsPage(QWidget):
 
         self.broker_input = QLineEdit(str(self.state.config.get("broker", DEFAULT_MQTT_BROKER)))
         self.broker_input.setFixedWidth(300)
-        
+
         self.port_input = QSpinBox()
         self.port_input.setRange(1, 65535)
         self.port_input.setButtonSymbols(QSpinBox.NoButtons)
         self.port_input.setValue(int(self.state.config.get("port", DEFAULT_MQTT_PORT)))
         self.port_input.setFixedWidth(100)
-        
+
         self.csi_input = QLineEdit(self.state.config.get("csi_data_dir", CSI_DATA_DIR))
         self.csi_input.setFixedWidth(400)
 
@@ -1960,7 +2457,7 @@ class SettingsPage(QWidget):
         self.save_btn.setFixedWidth(200)
         self.save_btn.clicked.connect(self.save_settings)
         form_layout.addRow("", self.save_btn)
-        
+
         self.layout.addWidget(form_frame)
         self.layout.addStretch(1)
 
@@ -1986,11 +2483,11 @@ class LogsPage(QWidget):
         self.parent = parent
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
-        
+
         title = QLabel("System Logs")
         title.setObjectName("PageTitle")
         self.layout.addWidget(title)
-        
+
         self.text_area = QTextEdit()
         self.text_area.setReadOnly(True)
         self.text_area.setStyleSheet("font-family: Consolas, 'Courier New', monospace; font-size: 13px; background-color: #2b2b2b; color: #a9b7c6; border-radius: 6px;")
@@ -2009,5 +2506,8 @@ class LogsPage(QWidget):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = DashboardMain()
-    window.show()
+    if window.is_authenticated():
+        window.show()
+    else:
+        sys.exit(1)
     sys.exit(app.exec())
