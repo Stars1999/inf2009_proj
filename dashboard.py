@@ -852,19 +852,26 @@ class DashboardMain(QMainWindow):
 
         self.signals = DashboardSignals()
         self.mqtt = MqttClient(self.state, self.signals)
+        
+        # Initialize pages dict early to prevent race conditions
+        self.pages = {}
 
+        # Setup UI BEFORE connecting signals and starting MQTT
+        self.setup_ui()
+
+        # Now connect signals - pages are guaranteed to exist
         self.signals.node_status.connect(self.on_node_status)
         self.signals.key_status.connect(self.on_key_status)
         self.signals.collection_progress.connect(self.on_collection_progress)
         self.signals.collection_complete.connect(self.on_collection_complete)
         self.signals.collection_stopped.connect(self.on_collection_stopped)
         self.signals.model_event.connect(self.on_model_event)
-        self.signals.training_result.connect(lambda node, success, msg: self.pages["ESP32-C3 Configuration"].on_training_result(node, success, msg))
+        self.signals.training_result.connect(self.on_training_result_safe)
         self.signals.error.connect(self.log_message)
 
+        # Start MQTT thread LAST - after all GUI is initialized
         self.mqtt.start()
 
-        self.setup_ui()
         self.update_timer = QTimer(self)
         self.update_timer.timeout.connect(self.periodic_refresh)
         self.update_timer.start(REFRESH_INTERVAL_MS)
@@ -909,8 +916,7 @@ class DashboardMain(QMainWindow):
         main_layout.setContentsMargins(30, 30, 30, 30)
 
         self.stack = QStackedWidget()
-        self.pages = {}
-
+        # Note: self.pages = {} is now initialized earlier in __init__
         self.pages["Homepage"] = HomePage(self.state)
         self.pages["Key Management"] = KeyMgmtPage(self.state)
         self.pages["ESP32-C3 Configuration"] = ESPConfigPage(self.state, self)
@@ -943,26 +949,35 @@ class DashboardMain(QMainWindow):
         self.stack.setCurrentIndex(idx)
 
     def process_mqtt_events(self):
+        # Guard: Don't process events if pages aren't initialized yet
+        if not self.pages:
+            return
+        
         while True:
             try:
                 event = self.mqtt.event_queue.get_nowait()
             except queue.Empty:
                 break
-            kind = event[0]
-            if kind == "error":
-                self.signals.error.emit(event[1])
-            elif kind == "node_status":
-                self.signals.node_status.emit(event[1], event[2])
-            elif kind == "key_status":
-                self.signals.key_status.emit(event[1], event[2])
-            elif kind == "collection_progress":
-                self.signals.collection_progress.emit(event[1], event[2], event[3])
-            elif kind == "collection_complete":
-                self.signals.collection_complete.emit(event[1], event[2], event[3])
-            elif kind == "collection_stopped":
-                self.signals.collection_stopped.emit(event[1], event[2])
-            elif kind == "model_event":
-                self.signals.model_event.emit(event[1], event[2])
+            
+            try:
+                kind = event[0]
+                if kind == "error":
+                    self.signals.error.emit(event[1])
+                elif kind == "node_status":
+                    self.signals.node_status.emit(event[1], event[2])
+                elif kind == "key_status":
+                    self.signals.key_status.emit(event[1], event[2])
+                elif kind == "collection_progress":
+                    self.signals.collection_progress.emit(event[1], event[2], event[3])
+                elif kind == "collection_complete":
+                    self.signals.collection_complete.emit(event[1], event[2], event[3])
+                elif kind == "collection_stopped":
+                    self.signals.collection_stopped.emit(event[1], event[2])
+                elif kind == "model_event":
+                    self.signals.model_event.emit(event[1], event[2])
+            except Exception as e:
+                print(f"Error processing MQTT event {kind}: {e}")
+                traceback.print_exc()
 
     def periodic_refresh(self):
         self.process_mqtt_events()
@@ -982,10 +997,21 @@ class DashboardMain(QMainWindow):
                     else:
                         with self.state.lock:
                             self.state.node_online[node_id] = False
-        if self.stack.currentWidget() in [self.pages["ESP32-C3 Configuration"], self.pages["Homepage"], self.pages["Key Management"]]:
-            self.pages["ESP32-C3 Configuration"].refresh(force=True)
-            self.pages["Homepage"].refresh()
-            self.pages["Key Management"].refresh()
+        
+        # Guard: Only refresh if pages and stack are initialized
+        if not self.pages or not hasattr(self, 'stack'):
+            return
+        
+        try:
+            if self.stack.currentWidget() in [self.pages.get("ESP32-C3 Configuration"), self.pages.get("Homepage"), self.pages.get("Key Management")]:
+                if "ESP32-C3 Configuration" in self.pages:
+                    self.pages["ESP32-C3 Configuration"].refresh(force=True)
+                if "Homepage" in self.pages:
+                    self.pages["Homepage"].refresh()
+                if "Key Management" in self.pages:
+                    self.pages["Key Management"].refresh()
+        except Exception as e:
+            print(f"Error in periodic_refresh: {e}")
 
     def propagate_node_status_change(self, node_id, is_online):
         """Centralized method to handle node status changes"""
@@ -1023,11 +1049,16 @@ class DashboardMain(QMainWindow):
             self.state.expected_calib.pop(node_id, None)
             self.state.expected_session.pop(node_id, None)
 
+        # Guard: Only update if pages are initialized
+        if not self.pages:
+            return
+
         # Update UI
         page = self.pages.get("ESP32-C3 Configuration")
         if page:
             try:
-                page.set_progress(node_id, 0, 0)
+                if hasattr(page, 'set_progress'):
+                    page.set_progress(node_id, 0, 0)
                 page.force_stop_button.hide()  # Hide force stop button
                 page.refresh()
                 page.status_label.setText(f"⚠️ Run corrupted: ESP32 went offline. Data collection incomplete.")
@@ -1064,29 +1095,58 @@ class DashboardMain(QMainWindow):
                     self.state.node_last_heartbeat[node_id] = time.time()
                     self.state.persist()
 
-        if self.stack.currentWidget() in [self.pages["ESP32-C3 Configuration"], self.pages["Homepage"], self.pages["Key Management"]]:
-            self.pages["ESP32-C3 Configuration"].refresh(force=True)
-            self.pages["Homepage"].refresh()
-            self.pages["Key Management"].refresh()
+        # Guard: Only refresh if pages are initialized
+        if not self.pages or not hasattr(self, 'stack'):
+            return
+        
+        try:
+            if self.stack.currentWidget() in [self.pages.get("ESP32-C3 Configuration"), self.pages.get("Homepage"), self.pages.get("Key Management")]:
+                if "ESP32-C3 Configuration" in self.pages:
+                    self.pages["ESP32-C3 Configuration"].refresh(force=True)
+                if "Homepage" in self.pages:
+                    self.pages["Homepage"].refresh()
+                if "Key Management" in self.pages:
+                    self.pages["Key Management"].refresh()
+        except Exception as e:
+            print(f"Error refreshing pages in on_node_status: {e}")
 
     def on_key_status(self, key_name, status):
         self.log_message(f"{key_name} status changed to {status}")
         with self.state.lock:
             self.state.keys[key_name] = status
             self.state.persist()
-        if self.stack.currentWidget() == self.pages["Key Management"]:
-            self.pages["Key Management"].refresh()
-        self.pages["Homepage"].refresh()
+        
+        # Guard: Only refresh if pages are initialized
+        if not self.pages or not hasattr(self, 'stack'):
+            return
+        
+        try:
+            if self.stack.currentWidget() == self.pages.get("Key Management"):
+                if "Key Management" in self.pages:
+                    self.pages["Key Management"].refresh()
+            if "Homepage" in self.pages:
+                self.pages["Homepage"].refresh()
+        except Exception as e:
+            print(f"Error refreshing pages in on_key_status: {e}")
 
     def on_collection_progress(self, node_id, cur, total):
         with self.state.lock:
             self.state.collection_in_progress[node_id] = True
             self.state.collection_progress[node_id] = (cur, total)
-        page = self.pages["ESP32-C3 Configuration"]
-        page.set_progress(node_id, cur, total)
-        # Refresh counts/display if the page is visible
-        if self.stack.currentWidget() == page:
-            page.refresh()
+        
+        # Guard: Only update if pages are initialized
+        if not self.pages:
+            return
+        
+        try:
+            page = self.pages.get("ESP32-C3 Configuration")
+            if page and hasattr(page, 'set_progress'):
+                page.set_progress(node_id, cur, total)
+                # Refresh counts/display if the page is visible
+                if hasattr(self, 'stack') and self.stack.currentWidget() == page:
+                    page.refresh()
+        except Exception as e:
+            print(f"Error in on_collection_progress: {e}")
 
     def on_collection_complete(self, node_id, label, session):
         self.log_message(f"Collection complete: {node_id}/{label} session={session}")
@@ -1098,18 +1158,27 @@ class DashboardMain(QMainWindow):
             self.state.expected_session.pop(node_id, None)
             self.state.persist()
 
+        # Guard: Only update if pages are initialized
+        if not self.pages:
+            return
+
         # Immediately reset the calibration progress UI to default (avoid lingering 100%)
         page = self.pages.get("ESP32-C3 Configuration")
         if page:
             try:
-                page.set_progress(node_id, 0, 0)
+                if hasattr(page, 'set_progress'):
+                    page.set_progress(node_id, 0, 0)
                 # ensure UI refresh reflects new state
                 page.refresh()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Error resetting progress in on_collection_complete: {e}")
 
-        if self.stack.currentWidget() == self.pages["ESP32-C3 Configuration"]:
-            self.pages["ESP32-C3 Configuration"].refresh()
+        try:
+            if hasattr(self, 'stack') and self.stack.currentWidget() == page:
+                if page:
+                    page.refresh()
+        except Exception as e:
+            print(f"Error refreshing page in on_collection_complete: {e}")
 
     def on_collection_stopped(self, node_id, body):
         reason = body.get("reason", "stopped") if isinstance(body, dict) else "stopped"
@@ -1126,16 +1195,24 @@ class DashboardMain(QMainWindow):
             return
 
         self.log_message(f"Collection stopped: {node_id} reason={reason} source={source}")
+        
+        # Guard: Only update if pages are initialized
+        if not self.pages:
+            return
+        
         page = self.pages.get("ESP32-C3 Configuration")
-        if page and page.node_selector.currentText() == node_id:
+        if page and hasattr(page, 'node_selector') and page.node_selector.currentText() == node_id:
             try:
-                page.set_progress(node_id, 0, 0)
-                page.force_stop_button.hide()
+                if hasattr(page, 'set_progress'):
+                    page.set_progress(node_id, 0, 0)
+                if hasattr(page, 'force_stop_button'):
+                    page.force_stop_button.hide()
                 page.refresh()
-                page.status_label.setText(f"Status: Calibration stopped ({reason})")
-                page.status_label.setStyleSheet("font-weight: bold; color: #ff9800; margin-top: 10px; font-size: 15px;")
-            except Exception:
-                pass
+                if hasattr(page, 'status_label'):
+                    page.status_label.setText(f"Status: Calibration stopped ({reason})")
+                    page.status_label.setStyleSheet("font-weight: bold; color: #ff9800; margin-top: 10px; font-size: 15px;")
+            except Exception as e:
+                print(f"Error in on_collection_stopped: {e}")
 
     def on_model_event(self, node_id, body):
         event = body.get("event", "")
@@ -1147,10 +1224,41 @@ class DashboardMain(QMainWindow):
             with self.state.lock:
                 self.state.model_state[node_id] = False
                 self.state.persist()
-        self.pages["ESP32-C3 Configuration"].on_model_event(node_id, body)
+        
+        # Guard: Only update if pages are initialized
+        if not self.pages:
+            return
+        
+        page = self.pages.get("ESP32-C3 Configuration")
+        if page and hasattr(page, 'on_model_event'):
+            try:
+                page.on_model_event(node_id, body)
+            except Exception as e:
+                print(f"Error in on_model_event: {e}")
+    
+    def on_training_result_safe(self, node, success, msg):
+        """Thread-safe wrapper for training result signal"""
+        if not self.pages:
+            return
+        
+        page = self.pages.get("ESP32-C3 Configuration")
+        if page and hasattr(page, 'on_training_result'):
+            try:
+                page.on_training_result(node, success, msg)
+            except Exception as e:
+                print(f"Error in on_training_result: {e}")
 
     def log_message(self, text):
-        self.pages["Logs"].append_log(text)
+        # Guard: Only log if pages are initialized
+        if not self.pages:
+            return
+        
+        page = self.pages.get("Logs")
+        if page and hasattr(page, 'append_log'):
+            try:
+                page.append_log(text)
+            except Exception as e:
+                print(f"Error appending log: {e}")
 
     def closeEvent(self, event):
         self.state.persist()
