@@ -148,4 +148,5 @@ profiling/scripts/run_worktree_compare.sh <baseline_commit>
 - `model_store/<NODE>/` contains the active artifacts; `model_store/_tmp/` is for temporary training output.
 - `heartbeat_state.json` is a local runtime file used by the dashboard to avoid stale online/offline state.
 - TensorFlow is optional; if it is unavailable, use `train_improved_grouped_model.py`.
+- `server.py` exposes `/health` for firmware profile validation before the ESP32 settles on a Wi-Fi/MQTT/HTTP combination.
 - For firmware build and flash steps, see `edge-esp32/README.md`.

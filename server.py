@@ -780,6 +780,15 @@ def get_scaler_params(node_id):
         pass
     return send_file(path, mimetype="application/json", as_attachment=False)
 
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({
+        "status": "ok",
+        "mqtt_broker": MQTT_BROKER,
+        "mqtt_port": MQTT_PORT,
+    }), 200
+
 @app.route('/upload_data', methods=['POST'])
 def upload_data():
     upload_start_us = time.perf_counter_ns() // 1000
